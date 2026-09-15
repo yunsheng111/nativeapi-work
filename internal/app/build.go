@@ -112,25 +112,25 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 
-	// 会话粘性路由（可配关闭）。
+	// 会话粘性路由：路由器**始终构建**（轻量），是否生效由 live.StickyEnabled 热开关
+	// 门控（面板一键切换，无需重启）。默认关闭——粘性改变分配行为，由用户手动开启。
+	// TTL 从 config 解析（"0" = 永久保留，仅账号不可用时漂移）。
 	var sessRouter *session.Router
 	redisMode := "noop"
 	if _, ok := store.(redisstore.Noop); !ok {
 		redisMode = "upstash"
 	}
-	if cfg.SessionSticky.Enabled {
-		sessRouter = session.New(session.Config{
-			TTL:        cfg.SessionTTL,
-			GCInterval: cfg.SessionGCInterval,
-			Store:      store,
-			Available:  p.AvailableUIDs,
-			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
-			// 裸名走 cn（现状零回归）。闭包内部 ResolveModel 剥前缀，再按 realm 过滤。
-			AvailableForModel: RealmAwareAvailableForModel(p),
-		})
-		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
-		sessRouter.StartGC()
-	}
+	sessRouter = session.New(session.Config{
+		TTL:        cfg.SessionTTL,
+		GCInterval: cfg.SessionGCInterval,
+		Store:      store,
+		Available:  p.AvailableUIDs,
+		// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
+		// 裸名走 cn（现状零回归）。闭包内部 ResolveModel 剥前缀，再按 realm 过滤。
+		AvailableForModel: RealmAwareAvailableForModel(p),
+	})
+	sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
+	sessRouter.StartGC()
 	sessCount := func() int {
 		if sessRouter != nil {
 			return sessRouter.Count()
@@ -191,6 +191,7 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		StickyEnabled:        cfg.SessionSticky.Enabled,
 	})
 	// 换号能力：仅在粘性路由启用时注入解绑闭包（粘性关闭时没有会话可解绑，
 	// 闭包留 nil 让面板的 switch/force 明确返回 501，而不是假装成功）。
@@ -216,6 +217,37 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		rebindSession = sessRouter.RebindByID
 		bindAllSessions = sessRouter.BindAllTo
 	}
+	// 粘性热开关：先改 live 快照（本进程立即生效），再把 session_sticky.enabled
+	// 写回 config.json（重启后保持）。两步都必须做——只热更会在重启后回退，
+	// 只落盘则要重启才生效。
+	setStickyEnabled := func(v bool) error {
+		s := live.Load()
+		s.StickyEnabled = v
+		live.Store(s)
+		cfg.SessionSticky.Enabled = v
+		raw, err := os.ReadFile(cfgPath)
+		if err != nil {
+			return fmt.Errorf("read config: %w", err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return fmt.Errorf("parse config: %w", err)
+		}
+		ss, ok := m["session_sticky"].(map[string]any)
+		if !ok || ss == nil {
+			ss = map[string]any{}
+			m["session_sticky"] = ss
+		}
+		ss["enabled"] = v
+		out, err := json.MarshalIndent(m, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(cfgPath, out, 0o644); err != nil {
+			return fmt.Errorf("write config: %w", err)
+		}
+		return nil
+	}
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Upstream:    up,
@@ -232,6 +264,9 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		ListBindings:    listBindings,
 		RebindSession:   rebindSession,
 		BindAllSessions: bindAllSessions,
+		// 粘性热开关的读写点：读走 live（含启动时 config 值），写 = live + 落盘。
+		StickyEnabled:   func() bool { return live.Load().StickyEnabled },
+		SetStickyEnabled: setStickyEnabled,
 		// 宿主切号：把池内账号写入 WorkBuddy 官方客户端登录态（备份→关客户端→写→重启）。
 		// 备份落在数据目录内；认证文件路径默认用 hostswitch 官方位置，可用
 		// WB_HOST_AUTH_FILE 覆盖（测试注入临时文件 / 便携部署自定义位置）。

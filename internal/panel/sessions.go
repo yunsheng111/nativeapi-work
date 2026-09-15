@@ -58,7 +58,34 @@ func (p *Panel) sessionsList(w http.ResponseWriter, r *http.Request) {
 			"cooling":   s.Cooling,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"bindings": bindings, "accounts": out})
+	writeJSON(w, http.StatusOK, map[string]any{"bindings": bindings, "accounts": out, "sticky_enabled": p.cfg.StickyEnabled != nil && p.cfg.StickyEnabled()})
+}
+
+// stickyBody 粘性热开关请求体。
+type stickyBody struct {
+	Enabled bool `json:"enabled"`
+}
+
+// stickyToggle POST /panel/api/sticky —— 粘性会话总开关（热生效 + 落盘）。
+// 开启：会话按 conversationId 钉在所选账号（默认永久保留，仅账号不可用时漂移）；
+// 关闭：请求按权重正常分配，**历史绑定保留**，重新开启后立即恢复粘性。
+func (p *Panel) stickyToggle(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.SetStickyEnabled == nil {
+		writeErr(w, http.StatusNotImplemented, "sticky toggle unavailable")
+		return
+	}
+	var body stickyBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if err := p.cfg.SetStickyEnabled(body.Enabled); err != nil {
+		log.Printf("panel: 粘性开关写入失败 enabled=%v: %v", body.Enabled, err)
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	log.Printf("panel: 粘性会话已%s（热生效 + 已写入配置）", map[bool]string{true: "开启", false: "关闭"}[body.Enabled])
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "sticky_enabled": body.Enabled})
 }
 
 // rebindBody 会话改绑请求体。

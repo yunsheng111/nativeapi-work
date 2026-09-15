@@ -93,11 +93,11 @@ func TestNewPoolConfigDefaults(t *testing.T) {
 	if c.SoftRateMaxDur.Hours() != 2 {
 		t.Errorf("soft_rate_max=%v want 2h", c.SoftRateMaxDur)
 	}
-	if !c.SessionSticky.Enabled {
-		t.Error("session_sticky.enabled want true")
+	if c.SessionSticky.Enabled {
+		t.Error("session_sticky.enabled want false（默认关闭，用户手动开启）")
 	}
-	if c.SessionTTL.Minutes() != 30 || c.SessionGCInterval.Minutes() != 5 {
-		t.Errorf("session durations=%v/%v", c.SessionTTL, c.SessionGCInterval)
+	if c.SessionTTL != 0 || c.SessionGCInterval.Minutes() != 5 {
+		t.Errorf("session durations=%v/%v（TTL 0 = 永久保留）", c.SessionTTL, c.SessionGCInterval)
 	}
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		t.Errorf("upstash default should be empty: %+v", c.Upstash)

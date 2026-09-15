@@ -980,6 +980,7 @@ function fmtAge(sec) {
 }
 function fmtTTL(sec) {
   if (sec == null) return '—';
+  if (sec === -1) return '永久';
   if (sec <= 0) return '即将过期';
   if (sec < 60) return sec + 's';
   if (sec < 3600) return Math.floor(sec / 60) + 'm';
@@ -990,6 +991,11 @@ async function loadSessions() {
   try {
     const d = await api('sessions');
     sessData = d;
+    // 粘性总开关状态：按钮文案 + 列表语义提示。关闭时绑定仍列出（保留态），但注明未生效。
+    const on = !!d.sticky_enabled;
+    const btn = $('btnSticky');
+    btn.textContent = on ? '关闭粘性' : '开启粘性';
+    btn.className = on ? 'xs primary' : 'xs';
     const accounts = d.accounts || [];
     const sel = $('sessTarget');
     const prev = sel.value;
@@ -997,11 +1003,14 @@ async function loadSessions() {
       esc(a.nickname || a.uid.slice(0, 8) + '…') + (a.available ? '' : '（不可用）') + '</option>').join('');
     if (prev && accounts.some(a => a.uid === prev)) sel.value = prev;
     const list = d.bindings || [];
-    $('sessHint').textContent = list.length
-      ? list.length + ' 条绑定 · 同一对话尽量固定在同一个账号'
-      : '当前没有粘性绑定（客户端发出带会话 id 的请求后才会建立）';
+    $('sessHint').textContent = !on
+      ? '粘性已关闭：请求按权重正常分配；历史绑定保留，开启后立即恢复'
+      : list.length
+        ? list.length + ' 条绑定 · 同一对话固定走同一账号（账号出问题时自动漂移）'
+        : '当前没有粘性绑定（客户端发出带会话 id 的请求后才会建立）';
     if (!list.length) {
-      tb.innerHTML = '<tr><td colspan="7"><div class="empty"><div class="big">没有粘性会话</div>客户端带 conversationId 的请求会在网关侧建立"会话 → 账号"绑定</div></td></tr>';
+      tb.innerHTML = '<tr><td colspan="7"><div class="empty"><div class="big">' + (on ? '没有粘性会话' : '粘性会话未开启') + '</div>' +
+        (on ? '客户端带 conversationId 的请求会在网关侧建立"会话 → 账号"绑定' : '点击右上角「开启粘性」后，同一对话会固定走同一账号') + '</div></td></tr>';
       return;
     }
     const nick = k => { const a = accounts.find(x => x.uid === k); return a ? (a.nickname || k.slice(0, 8) + '…') : k.slice(0, 8) + '…'; };
@@ -1039,6 +1048,17 @@ $('sessBody').addEventListener('click', async ev => {
     loadSessions(); loadOverview(true);
   } catch (e) { toast(e.message, 'err'); } finally { b.disabled = false; }
 });
+$('btnSticky').onclick = async () => {
+  const on = !!(sessData && sessData.sticky_enabled);
+  const next = !on;
+  if (next && !confirm('开启粘性会话？\n同一对话将固定走同一个账号（永久保留，账号冷却/锁定/占满时才自动漂移）。\n上游 prompt 缓存命中率会显著提升；代价是单账号的会话集中度变高。')) return;
+  if (!next && !confirm('关闭粘性会话？\n之后请求按权重正常分配（每轮可能换号，上游上下文缓存不再命中）；\n历史绑定保留，重新开启后立即恢复。')) return;
+  try {
+    await api('sticky', { method: 'POST', body: JSON.stringify({ enabled: next }) });
+    toast(next ? '粘性会话已开启（已写入配置，重启后保持）' : '粘性会话已关闭（历史绑定保留）', 'ok');
+    loadSessions();
+  } catch (e) { toast(e.message, 'err'); }
+};
 $('btnSessRefresh').onclick = () => { loadSessions(); loadOverview(true); };
 $('btnAdoptAll').onclick = async () => {
   const uid = $('sessTarget').value;

@@ -52,14 +52,14 @@ type Router struct {
 	stop    chan struct{}
 }
 
-// New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
-// TTL/GCInterval 非正取默认（30m / 5m）——main 从 config 解析后传入，这里兜底。
+// New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）。
+// TTL 语义：>0 按时间过期（滚动续期）；<=0 表示**永久保留**——绑定只随账号可用性
+// 漂移（冷却/锁定/占满/模型限额时重分配），不做时间清理。面板开关需要"除非账号
+// 出问题否则一直保留"，故 0 是显式语义而非缺省，缺省回落已上移到 config 层。
+// GCInterval 非正取默认（5m）；TTL<=0 时 GC 本身是空操作。
 func New(cfg Config) *Router {
 	if cfg.Store == nil {
 		cfg.Store = redisstore.Noop{}
-	}
-	if cfg.TTL <= 0 {
-		cfg.TTL = 30 * time.Minute
 	}
 	if cfg.GCInterval <= 0 {
 		cfg.GCInterval = 5 * time.Minute
@@ -305,7 +305,7 @@ type Binding struct {
 	UID       string `json:"uid"`            // 当前绑定的账号
 	Kind      string `json:"kind"`           // conversation（客户端给的 id）| derived（内容派生）
 	AgeSec    int64  `json:"age_sec"`        // 距最后一次真实活跃的秒数
-	TTLRemain int64  `json:"ttl_remain_sec"` // 绑定剩余存活时间；<=0 表示下轮 GC 清理
+	TTLRemain int64  `json:"ttl_remain_sec"` // 绑定剩余存活时间；-1 = 永久保留；<=0 且非 -1 表示下轮 GC 清理
 }
 
 // keyIDLen 会话键短哈希字节数（10 字节 = 20 hex；对内存级会话表碰撞概率可忽略）。
@@ -330,14 +330,19 @@ func keyKind(key string) string {
 func (r *Router) Bindings() []Binding {
 	now := time.Now()
 	r.mu.RLock()
+	ttl := r.cfg.TTL
 	out := make([]Binding, 0, len(r.entries))
 	for key, e := range r.entries {
+		remain := int64(-1) // 永久保留
+		if ttl > 0 {
+			remain = int64((ttl - now.Sub(e.lastActive)).Seconds())
+		}
 		out = append(out, Binding{
 			ID:        keyID(key),
 			UID:       e.uid,
 			Kind:      keyKind(key),
 			AgeSec:    int64(now.Sub(e.lastActive).Seconds()),
-			TTLRemain: int64((r.cfg.TTL - now.Sub(e.lastActive)).Seconds()),
+			TTLRemain: remain,
 		})
 	}
 	r.mu.RUnlock()
@@ -398,8 +403,11 @@ func (r *Router) BindAllTo(uid string) int {
 	return len(keys)
 }
 
-// gcOnce 清理 TTL 过期的绑定，并镜像删除。
+// gcOnce 清理 TTL 过期的绑定，并镜像删除。TTL<=0（永久保留）时是空操作。
 func (r *Router) gcOnce(now time.Time) int {
+	if r.cfg.TTL <= 0 {
+		return 0
+	}
 	r.mu.Lock()
 	var expiredKeys []string
 	for key, e := range r.entries {
@@ -439,6 +447,9 @@ func (r *Router) availableSlice(model string) []string {
 }
 
 func expired(e entry, now time.Time, ttl time.Duration) bool {
+	if ttl <= 0 {
+		return false // 永久保留：只随账号可用性漂移
+	}
 	return now.Sub(e.lastActive) > ttl
 }
 

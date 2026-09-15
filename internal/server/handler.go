@@ -71,6 +71,15 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	}
 }
 
+// stickyOn 报告粘性会话是否生效。Live 未注入（单测/内嵌调用方）时视为开启——
+// 与引入热开关前的历史行为一致，测试无需逐个补 Live。
+func (h *Handler) stickyOn() bool {
+	if h.cfg.Live == nil {
+		return true
+	}
+	return h.cfg.Live.Load().StickyEnabled
+}
+
 // softCooldown 返回当前生效的软冷却基数（热改优先，<=0 回退默认）。
 func (h *Handler) softCooldown() time.Duration {
 	if d := h.loadLive().SoftCooldown; d > 0 {
@@ -400,8 +409,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
 	sessKey := session.ExtractKey(body)
+	// 粘性热开关（live）：关闭时请求按权重正常分配，路由器保留既有绑定——
+	// 重新开启后历史对话立即恢复粘性，不丢。
 	stickyUID := ""
-	if h.cfg.Session != nil && sessKey != "" {
+	if h.cfg.Session != nil && sessKey != "" && h.stickyOn() {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
 		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
@@ -606,7 +617,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
+		// 粘性关闭时不回绑：避免"关着开关却持续写绑定"，让会话页的绑定列表反映真实生效状态。
+		if sessKey != "" && h.cfg.Session != nil && h.stickyOn() {
 			h.cfg.Session.Bind(sessKey, acct.UID)
 		}
 		if peek.Stream {

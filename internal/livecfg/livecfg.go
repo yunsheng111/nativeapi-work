@@ -18,6 +18,9 @@ type Snapshot struct {
 	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
+	// StickyEnabled 粘性会话总开关（面板热切换）。false 时请求按权重正常分配，
+	// 会话路由器保留既有绑定（重新开启立即恢复粘性，不丢历史）。
+	StickyEnabled bool
 }
 
 // Holder 原子持有当前快照。

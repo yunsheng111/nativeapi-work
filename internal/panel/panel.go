@@ -63,6 +63,10 @@ type Config struct {
 	RebindSession func(id, uid string) int
 	// BindAllSessions 把全部会话改绑到账号（「全部会话切到此号」）。
 	BindAllSessions func(uid string) int
+	// StickyEnabled 读粘性热开关当前状态；SetStickyEnabled 热切换并落盘。
+	// nil 时开关端点 501（理论不可达：路由器始终构建）。
+	StickyEnabled   func() bool
+	SetStickyEnabled func(bool) error
 
 	// HostSwitch 宿主切号服务（写 WorkBuddy 官方客户端登录态文件）；nil 时宿主
 	// 端点返回 501（非 Windows / 显式关闭）。指针直连而非闭包：hostswitch 是
@@ -171,6 +175,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/sessions", p.withAuth(p.sessionsList))
 	p.mux.HandleFunc("POST /panel/api/sessions/rebind", p.withAuth(p.sessionRebind))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/adopt_sessions", p.withAuth(p.accountAdoptSessions))
+	p.mux.HandleFunc("POST /panel/api/sticky", p.withAuth(p.stickyToggle))
 	p.mux.HandleFunc("GET /panel/api/host/current", p.withAuth(p.hostCurrent))
 	p.mux.HandleFunc("POST /panel/api/host/switch", p.withAuth(p.hostSwitch))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
@@ -258,6 +263,10 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 各账号粘性会话数：面板在「换号」按钮上展示"将影响 N 个会话"，让影响面点击前可见。
 	if p.cfg.BoundUIDs != nil {
 		resp["bound_uids"] = p.cfg.BoundUIDs()
+	}
+	// 粘性热开关状态：会话页开关按钮的当前态。
+	if p.cfg.StickyEnabled != nil {
+		resp["sticky_enabled"] = p.cfg.StickyEnabled()
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

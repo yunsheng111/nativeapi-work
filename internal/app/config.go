@@ -149,8 +149,8 @@ type Config struct {
 	} `json:"pool"`
 
 	SessionSticky struct {
-		Enabled    bool   `json:"enabled"`     // 默认 true
-		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
+		Enabled    bool   `json:"enabled"`     // 默认 false：粘性是行为改变，由用户在面板手动开启（热生效）
+		TTL        string `json:"ttl"`         // 会话绑定 TTL；"0" = 永久保留（仅账号不可用时漂移），默认
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
@@ -206,8 +206,8 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
-	c.SessionSticky.Enabled = true
-	c.SessionSticky.TTL = "30m"
+	c.SessionSticky.Enabled = false // 粘性改变"同对话固定走同号"的分配行为：默认关，面板手动开
+	c.SessionSticky.TTL = "0"       // 0 = 不过期；绑定只随账号可用性漂移（用户预期：除非账号出问题否则一直保留）
 	c.SessionSticky.GCInterval = "5m"
 	return c
 }

@@ -428,6 +428,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header>
           <h3>粘性会话 <span class="hint" id="sessHint"></span></h3>
           <span class="grow"></span>
+          <button class="xs" id="btnSticky" title="开启后同一对话固定走同一账号（永久保留，账号冷却/锁定/占满时才自动漂移）；关闭后按权重正常分配，历史绑定保留">开启粘性</button>
           <select id="sessTarget"></select>
           <button class="xs" id="btnAdoptAll" title="把当前所有粘性会话改绑到所选账号">全部切到此号</button>
           <button class="xs" id="btnSessRefresh">刷新</button>

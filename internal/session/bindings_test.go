@@ -90,3 +90,24 @@ func TestBindingsKindDerived(t *testing.T) {
 		t.Fatalf("kind=%v want derived", bs)
 	}
 }
+
+func TestPermanentTTLOnlyDriftsOnAvailability(t *testing.T) {
+	// TTL=0（永久保留）：时间流逝与 GC 都不清绑定；只有账号不可用才漂移。
+	r := routerWith(newCountingStore(), []string{"a1", "a2"}, 0)
+	uid, ok := r.Resolve("conversation-A")
+	if !ok {
+		t.Fatal("resolve failed")
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if n := r.gcOnce(time.Now()); n != 0 {
+		t.Fatalf("永久 TTL 下 GC 不应清理，cleared=%d", n)
+	}
+	if got, ok2 := r.Resolve("conversation-A"); !ok2 || got != uid {
+		t.Fatalf("永久 TTL 下绑定应保持：want %s got %s (ok=%v)", uid, got, ok2)
+	}
+	for _, b := range r.Bindings() {
+		if b.TTLRemain != -1 {
+			t.Fatalf("ttl_remain_sec=%d want -1（永久）", b.TTLRemain)
+		}
+	}
+}
