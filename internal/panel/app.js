@@ -154,6 +154,7 @@ function renderAccounts(list) {
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0);
     let cls = '', tag;
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
+    else if (s.locked) { cls = 'cool'; tag = '<span class="tag warn">已锁定</span>'; }
     else if (cool > 0) {
       cls = 'cool';
       const kind = bl > (s.cool_remaining_sec || 0) ? '熔断' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却');
@@ -167,6 +168,18 @@ function renderAccounts(list) {
       : Math.round((s.credits || 0) / maxCred * 100);
     const credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
     const frozen = s.disabled || cool > 0;
+    // 换号按钮：禁用号本就不参与选号，换号无意义 → 只在未禁用时给出。
+    // 该号上挂着的会话数从 bound_uids 取，显示在 title 里（点击前可见影响面）。
+    const boundN = boundCount(s.uid);
+    const ejectBtn = s.disabled
+      ? ''
+      : '<button class="xs ghost" data-a="eject" data-u="' + esc(s.uid) + '" title="把该号从选号中推开 5 分钟，并解绑它上面的 ' + boundN + ' 个会话">换号</button>';
+    // 锁定/解锁：人工"我不想用它"（不被自动复活路径清除），与"禁用"（判死）并存。
+    // 已锁定时按钮显示「解锁」；否则显示「锁定」。禁用号也给锁定按钮——两维度正交，
+    // 用户可能既判死又锁定（解锁后仍禁用），面板应允许分别操作。
+    const lockBtn = s.locked
+      ? '<button class="xs primary" data-a="unlock" data-u="' + esc(s.uid) + '" title="解除人工锁定">解锁</button>'
+      : '<button class="xs ghost" data-a="lock" data-u="' + esc(s.uid) + '" title="锁定后该号不再被选中；与「禁用」不同，锁定不会被签到/重登自动清除">锁定</button>';
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = formatTokenCount(tu.total_tokens);
@@ -189,14 +202,25 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
+        ejectBtn +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
+        lockBtn +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
+}
+
+// boundCount 返回某账号当前挂着的粘性会话数（overview.bound_uids 派生；字段缺失时 1，
+// 表示"至少可能有一个"——用 0 会让「换号」按钮的 title 显示"解绑 0 个会话"而实际有，
+// 反而误导）。overviewData 未就绪时也返回 1（保守估计）。
+function boundCount(uid) {
+  const m = overviewData && overviewData.bound_uids;
+  if (!m || m[uid] == null) return 1;
+  return m[uid];
 }
 
 async function loadOverview(quiet) {
@@ -206,7 +230,9 @@ async function loadOverview(quiet) {
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
-    $('sDisabled').textContent = d.disabled;
+    // disabled 计数含人工锁定号（pool 侧保证 total = healthy+cooling+disabled 恒等式）。
+    // 若有锁定号，在数字后补一个小标记，让"不可用里有多少是我自己锁的"一眼可见。
+    $('sDisabled').textContent = d.locked ? d.disabled + '（锁 ' + d.locked + '）' : d.disabled;
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
@@ -230,6 +256,8 @@ $('accBody').addEventListener('click', async ev => {
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。确认禁用？')) return;
+  if (a === 'eject' && !confirm('换号会把该账号从选号中推开 5 分钟，并解绑它上面的全部会话（这些会话下一轮会落到其他账号）。确认换号？')) return;
+  if (a === 'lock' && !confirm('锁定后该账号不再被选中，且不会被签到/重登自动恢复，需手动解锁。确认锁定？')) return;
   b.disabled = true;
   try {
     if (a === 'checkin') {
@@ -244,6 +272,15 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'disable') {
       await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
       toast('已禁用', 'ok');
+    } else if (a === 'eject') {
+      const r = await api('accounts/' + encodeURIComponent(u) + '/eject', { method: 'POST' });
+      toast('已换号：避让 ' + r.duration_sec + ' 秒，解绑 ' + r.unbound_sessions + ' 个会话', 'ok');
+    } else if (a === 'lock') {
+      const r = await api('accounts/' + encodeURIComponent(u) + '/lock', { method: 'POST' });
+      toast('已锁定' + (r.unbound_sessions ? '，解绑 ' + r.unbound_sessions + ' 个会话' : ''), 'ok');
+    } else if (a === 'unlock') {
+      await api('accounts/' + encodeURIComponent(u) + '/unlock', { method: 'POST' });
+      toast('已解锁', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
     } else if (a === 'remove') {
@@ -253,6 +290,17 @@ $('accBody').addEventListener('click', async ev => {
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; loadOverview(true); }
 });
+
+$('btnForceSwitch').onclick = async () => {
+  if (!confirm('一键换号会解绑全部粘性会话，让所有进行中的对话下一轮落到其他账号上。\n账号状态不变（不会禁用任何号）。确认执行？')) return;
+  const b = $('btnForceSwitch');
+  b.disabled = true;
+  try {
+    const r = await api('switch/force', { method: 'POST' });
+    toast('已换号：解绑 ' + r.unbound_sessions + ' 个会话，当前可用 ' + r.available + ' 个账号', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { b.disabled = false; loadOverview(true); }
+};
 
 $('btnCheckinAll').onclick = async () => {
   try { await api('checkin_all', { method: 'POST' }); toast('全部签到已开始，结果见日志', 'ok'); }

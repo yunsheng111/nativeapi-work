@@ -75,6 +75,11 @@ type Status struct {
 	Realm           string     `json:"realm,omitempty"`
 	Disabled        bool       `json:"disabled"`
 	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	// Locked 人工锁定（面板「锁定」按钮，不等于 disabled）。面板据此渲染"已锁定"徽标
+	// 与解锁按钮；locked 号不参与选号（healthy 返回 false），但不会被自动复活路径清除。
+	// 不加 omitempty：与 Disabled 一致地**总是**输出明确布尔值，让 API 消费者能区分
+	// "未锁定"与"字段缺失"（前端 falsy 判断不受影响，但契约更清晰）。
+	Locked bool `json:"locked"`
 	SuccessCount    int64      `json:"success_count,omitempty"`
 	ErrTotal        int64      `json:"err_total,omitempty"`
 	LastSuccessTime time.Time  `json:"last_success,omitempty"`
@@ -126,8 +131,15 @@ type entry struct {
 	coolKind        CoolKind
 	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
 	disabled        bool
-	reason          string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	// locked 人工锁定（面板「锁定」按钮）：运维显式把该号排除在选号之外，直到解锁。
+	// 与 disabled 的区别是**语义**而非机制——disabled 表达"这个号坏掉了/死 session"，
+	// 由错误策略自动写入；locked 表达"这个号是好的，但我不想让它被选中"，纯人工意图。
+	// 两者在选号上等价（都不可选），但面板/日志的呈现与后续自动化处置不同：
+	// 自动复活（ReviveDisabled/ReenableIfCredits/签到解冻）不应把人工锁定一并解除，
+	// 否则运维的"锁定"会被下一次签到默默推翻。持久化（stateAccount.Locked）。
+	locked bool
+	reason string
+	lastUsed time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -159,9 +171,13 @@ type entry struct {
 	inFlight atomic.Int64
 }
 
-// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
+// healthy 报告账号当前是否可选（未禁用、未锁定、未处于任一冷却/熔断期）。
 func (e *entry) healthy(now time.Time) bool {
 	if e.disabled {
+		return false
+	}
+	if e.locked {
+		// 人工锁定：与 disabled 同为"不可选"终态，但只由 Lock/Unlock 翻转。
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -180,7 +196,7 @@ func (e *entry) healthy(now time.Time) bool {
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
 func (e *entry) modelExempt() bool {
 	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && e.breakerUntil.IsZero()
+		!e.disabled && !e.locked && e.breakerUntil.IsZero()
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
@@ -197,7 +213,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 }
 
 // healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
-//   - disabled → 永不可选（最高优先级）；
+//   - disabled / locked → 永不可选（最高优先级）；
 //   - 该模型正处 6004 独立冷却（modelCooldowns[reqModel] 未过期）→ 不可选
 //     （多模型限流时各自独立，互不影响）；
 //   - 否则 → 回落到账号级 healthy（until/breakerUntil 维度）。
@@ -206,7 +222,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 // 任意多个模型同时限流：被 B 限流的账号对 A 请求仍可选（A 不在 modelCooldowns 拦截
 // 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
-	if e.disabled {
+	if e.disabled || e.locked {
 		return false
 	}
 	if e.modelCooled(now, reqModel) {
@@ -277,6 +293,10 @@ type stateAccount struct {
 	// SoftStreak 连续软冷却次数（软退避指数）。旧 state.json 缺此字段 → 零值，
 	// 退避从基数重新开始（向后兼容）。
 	SoftStreak int `json:"soft_streak,omitempty"`
+	// Locked 人工锁定标记（面板「锁定」按钮）。与 Disabled 分开持久化：二者语义不同
+	// （自动判死 vs 人工避让），自动复活路径不得误清人工意图。旧 state.json 缺此字段
+	// → 零值（未锁定），向后兼容。
+	Locked bool `json:"locked,omitempty"`
 }
 
 // stateFile 持久化格式。
@@ -303,6 +323,14 @@ const sessionDeadThreshold = 3
 
 // sessionDeadReason 12153 判定为 session 死亡时的持久化 reason。
 const sessionDeadReason = "12153 session dead"
+
+// defaultEjectDuration 人工换号（Eject）的默认避让时长。取 5 分钟：
+// 足够让当前会话下一次哈希重分配落到别的号（期间旧号不进候选集），
+// 又不至于让运维"换一下号"造成账号长时间闲置。
+const defaultEjectDuration = 5 * time.Minute
+
+// lockReasonManual 面板人工锁定时的默认原因文案。
+const lockReasonManual = "manual lock (panel)"
 
 // SessionDeadThreshold 暴露连续 12153 的禁用阈值（供 scheduler 日志/运维文档引用）。
 func SessionDeadThreshold() int { return sessionDeadThreshold }

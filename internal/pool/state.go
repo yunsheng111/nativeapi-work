@@ -17,6 +17,74 @@ func (p *Pool) Disable(uid, reason string) {
 	}
 }
 
+// Eject 人工临时避让：把账号从选号中推开 d 时长（面板「换号」按钮）。
+// 与 Cooldown 的差异见 ejectLocked：**不喂熔断器、不自增 softStreak**——人工换号
+// 时上游无失败，不应伪造连续失败信号（否则连点换号能把健康号推进熔断）。
+// d<=0 时按 defaultEjectDuration 兜底。uid 不存在返回 false。
+//
+// 已锁定/已禁用的账号同样接受避让（不报错）：面板按钮可能并发点，避让对
+// 这些号是无人可换时的正常结果，静默接受比报错更符合运维直觉。
+// 但 target 为已禁用时避让无意义（它本就不可选），仍写入以便审计时间线。
+func (p *Pool) Eject(uid string, d time.Duration, reason string) bool {
+	if d <= 0 {
+		d = defaultEjectDuration
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	p.ejectLocked(e, d, reason)
+	return true
+}
+
+// Lock 人工锁定：把账号排除在选号之外，直到 Unlock（面板「锁定」按钮）。
+// 与 Disable 的区别：locking 是人工意图，**不会被自动复活路径清除**
+// （ReviveDisabled / ReenableIfCredits / NoteSuccess 均不触碰 locked）。
+// reason 为空时用 lockReasonManual 兜底。uid 不存在返回 false。
+func (p *Pool) Lock(uid, reason string) bool {
+	if reason == "" {
+		reason = lockReasonManual
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	p.lockLocked(e, reason)
+	return true
+}
+
+// Unlock 解除人工锁定，账号回到池子（若无其他冷却/熔断则立即可选）。
+// uid 不存在或本来就未锁定返回 false（供面板区分"已解锁"与"不存在/未锁"）。
+func (p *Pool) Unlock(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || !e.locked {
+		return false
+	}
+	p.unlockLocked(e)
+	return true
+}
+
+// LockedUIDs 返回当前被人工锁定的账号 UID 列表（按 UID 排序，稳定输出）。
+// 供面板概览/运维脚本判断"哪些号是我主动关掉的"。
+func (p *Pool) LockedUIDs() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	uids := make([]string, 0, len(p.byUID))
+	for uid, e := range p.byUID {
+		if e.locked {
+			uids = append(uids, uid)
+		}
+	}
+	sort.Strings(uids)
+	return uids
+}
+
 // NoteSessionDead 记录一次 ErrSessionDead（12153）——**不立即禁用**。
 // 旧行为一次 12153 即 Disable，但 12153 会被临时性触发（网络抖动/上游闪断/refresh
 // 竞态），一次失败就永久杀号会误杀健康账号（P0-1 侦察：13 个 disabled 号全部 refresh
@@ -56,20 +124,28 @@ func (p *Pool) ClearSessionDead(uid string) {
 // 账号回到池子（若无其他冷却/熔断则立即可选，健康检查自然接管）。
 // **不改** Disabled 在选号/状态端点的既有语义：disabled 号依然不参与选号，
 // 直到被本方法复活。不存在的 uid 为空操作。
+// **不触碰 locked**：人工锁定是独立于自动禁用的意图，复活一个被误判死 session 的号
+// 不应顺带解除运维的锁定（否则"锁住别再被用"会被自动路径推翻）。reason 的清理
+// 同样避开锁定期——locked 时 reason 承载锁定文案，清掉会让面板失去"为什么不可用"的线索。
 func (p *Pool) ReviveDisabled(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok && e.disabled {
 		e.disabled = false
-		e.reason = ""
+		if !e.locked {
+			e.reason = ""
+		}
 		e.sessionDeadFails = 0
 		p.dirty.Store(true)
 	}
 }
 
-// Revive 运维口径的"无条件恢复"：清禁用、冷却（含软退避计数）与熔断运行态。
-// 与 ReviveDisabled（只清禁用）和 ReenableIfCredits（只清冷却、不动熔断）的区别：
-// 本方法清除全部惩罚状态，供管理面板"解冻"按钮使用——人工判断该号可用时一键恢复。
+// Revive 运维口径的"无条件恢复"：清禁用、锁定、冷却（含软退避计数）与熔断运行态。
+// 与 ReviveDisabled（只清禁用，不碰锁定）和 ReenableIfCredits（只清冷却、不动熔断）
+// 的区别：本方法清除全部惩罚状态，供管理面板"解冻"按钮使用——人工判断该号可用时
+// 一键恢复。**一并清 locked**：解冻按钮是人工显式操作，若把人工锁定留着，用户点
+// "解冻"后号仍然不参与选号，按钮就是不生效的（违背"无条件恢复"承诺）。
+// 反之 ReviveDisabled 是自动复活路径，必须保留人工锁定意图（见 transition.go 正交性说明）。
 // uid 不存在返回 false（供调用方区分"账号不存在"与"已复活"）。
 func (p *Pool) Revive(uid string) bool {
 	p.mu.Lock()
@@ -79,6 +155,7 @@ func (p *Pool) Revive(uid string) bool {
 		return false
 	}
 	e.disabled = false
+	e.locked = false
 	e.until = time.Time{}
 	e.coolKind = 0
 	e.reason = ""
@@ -311,6 +388,10 @@ func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, di
 }
 
 // countsDetailedForRealm 是两函数共用的遍历实现；realm=="" 不加谓词。
+// locked 号计入 disabled 桶：二者对选号是同等效果（都不可选），且这样保持
+// total == healthy + cooling + disabled 的既有恒等式成立，不破坏下游不变量。
+// 面板要区分"人工锁定"与"被判死"，读 pool.List()[i].Locked 字段做精确展示——
+// 计数只需保证"不可选的号不被算进 healthy/cooling"，精确归因交给明细。
 func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -321,7 +402,7 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 		}
 		total++
 		switch {
-		case e.disabled:
+		case e.disabled || e.locked:
 			disabled++
 		case !e.healthy(now):
 			cooling++
@@ -398,6 +479,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:            e.reason,
 		Disabled:          e.disabled,
+		Locked:            e.locked,
 		SuccessCount:      e.successCount,
 		ErrTotal:          e.errTotal,
 		TokenUsage:        e.tokenUsage,

@@ -232,6 +232,61 @@ func (r *Router) Unbind(key string) bool {
 	return found
 }
 
+// UnbindByUID 解除所有绑定到 uid 的会话（返回解绑条数），供"强制换号"使用：
+// 把某个账号上的全部粘性会话一次性松绑，让这些会话下次请求重新分配。
+//
+// **必须与 pool.Eject 配合使用，单独调用无效**（这是本方法最容易踩的坑）：
+// ResolveForModel 的分配是确定性哈希——hashIndex(key, len(pool2)) 对同一 key 与
+// 同一候选集恒返回同一下标。若只解绑不避让，候选集（可用账号列表）没变，同一个
+// 会话 key 会被哈希回**完全相同的 uid**，等于没换号。正确姿势是：
+//
+//	session.UnbindByUID(uid)      // 松开旧号上的会话
+//	pool.Eject(uid, d, reason)    // 把旧号推出候选集 → 候选集变化 → 哈希落向别的号
+//
+// 两步都是必要的：解绑负责让**已绑定**的会话重新走分配路径；避让负责让重分配的
+// 结果**不是旧号**。单做避让不够——已绑定会话在快路径命中时只校验"账号是否仍可用"，
+// 而避让确实会让它失效并走慢路径，所以单做避让其实也能换动已绑定会话；但两者一起做
+// 语义更清晰、且对"避让到期后旧号立刻回归"的场景仍能保持会话落在新号上。
+//
+// 与"在途请求成功后回绑"的竞态（无需额外处理，此处记录推理）：
+// handler 在 chat 成功后会 Bind(sessKey, 实际成功号)。若换号发生在某请求在途期间，
+// 该请求成功会把会话绑回旧号，看似"撤销"了换号。但旧号此时已被 Eject（until 冷却中）
+// 或 Lock（永久不可选），而 ResolveForModel 的快路径**每次都要校验账号在 available 集内**，
+// 于是下一个请求立刻发现绑定号不可用 → 走慢路径重分配 → 落到新号。
+// 即：效果最多延迟一个请求，且不会被真正撤销。故 handler 无需感知换号操作。
+func (r *Router) UnbindByUID(uid string) int {
+	if uid == "" {
+		return 0
+	}
+	r.mu.Lock()
+	var keys []string
+	for key, e := range r.entries {
+		if e.uid == uid {
+			keys = append(keys, key)
+		}
+	}
+	for _, key := range keys {
+		delete(r.entries, key)
+	}
+	r.mu.Unlock()
+	for _, key := range keys {
+		r.cfg.Store.DelBind(key)
+	}
+	return len(keys)
+}
+
+// BoundUIDs 返回每个 uid 当前绑定的会话数（供面板展示"该号上挂了多少会话"，
+// 让"换号"的影响面在点击前可见）。无绑定返回空 map（非 nil）。
+func (r *Router) BoundUIDs() map[string]int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]int)
+	for _, e := range r.entries {
+		out[e.uid]++
+	}
+	return out
+}
+
 // Count 返回当前绑定数（供 /status 观测）。
 func (r *Router) Count() int {
 	r.mu.RLock()

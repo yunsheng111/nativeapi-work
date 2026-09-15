@@ -199,6 +199,10 @@ func main() {
 		APIKey:      cfg.APIKey,
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
+		// 换号能力：解绑指定账号上的粘性会话 + 展示各号会话数。闭包注入与 StickyCount
+		// 同风格，面板不直接依赖 session 包。
+		UnbindByUID: func(uid string) int { return sessRouter.UnbindByUID(uid) },
+		BoundUIDs:   sessRouter.BoundUIDs,
 		Version:     appVersion,
 		Live:        live,
 		ConfigPath:  *cfgPath,

@@ -49,6 +49,13 @@ type Config struct {
 
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
+	// UnbindByUID 解除某账号上的全部粘性会话绑定，返回解绑条数；nil 时换号功能降级
+	// （只做 pool 层避让、不解绑会话，见 forceSwitch 注释）。
+	// 用闭包而非 *session.Router 直连：与 StickyCount 同风格，面板不持有 session 包依赖。
+	UnbindByUID func(uid string) int
+	// BoundUIDs 返回每个账号当前绑定的会话数（uid → 条数），供面板展示换号影响面；
+	// nil 时该维度留空（不影响其他功能）。
+	BoundUIDs func() map[string]int
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -144,6 +151,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
+	// 换号与锁定：eject 临时避让（带时长）、lock/unlock 人工锁定、switch/force 一键换号。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/eject", p.withAuth(p.accountEject))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/lock", p.withAuth(p.accountLock))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/unlock", p.withAuth(p.accountUnlock))
+	p.mux.HandleFunc("POST /panel/api/switch/force", p.withAuth(p.forceSwitch))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
@@ -203,7 +215,16 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	accounts := p.cfg.Pool.List()
+	// locked 从明细派生（pool.CountsDetailed 的 disabled 桶含 locked，不单列——保持
+	// total == healthy+cooling+disabled 恒等式）。面板导航要显示"锁定 N"，故单独数一遍。
+	locked := 0
+	for i := range accounts {
+		if accounts[i].Locked {
+			locked++
+		}
+	}
+	resp := map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
 		"auth_required":   p.apiKey() != "",
@@ -213,9 +234,15 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"healthy":         healthy,
 		"cooling":         cooling,
 		"disabled":        disabled,
+		"locked":          locked,
 		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
-	})
+		"accounts":        accounts,
+	}
+	// 各账号粘性会话数：面板在「换号」按钮上展示"将影响 N 个会话"，让影响面点击前可见。
+	if p.cfg.BoundUIDs != nil {
+		resp["bound_uids"] = p.cfg.BoundUIDs()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
@@ -353,6 +380,144 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	log.Printf("panel: remove uid=%s（已出池并删除凭证文件）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
+
+// ---------------------------------------------------------------------------
+// 换号与锁定（面板「换号」/「锁定」/「强制换号」）
+// ---------------------------------------------------------------------------
+
+// ejectBody 换号接口的可选请求体：{"duration_sec": N, "reason": "..."}。
+// 全部字段可省——空体 / 非法 JSON 都按默认时长处理（面板只发空体，带时长是给脚本用）。
+type ejectBody struct {
+	DurationSec int    `json:"duration_sec"`
+	Reason      string `json:"reason"`
+}
+
+// accountEject 单号临时避让（面板「换号」按钮）：解绑该号上的粘性会话 + 把该号
+// 推出选号候选集 duration_sec 秒（默认 pool 侧 5 分钟）。两步必须同时做，理由见
+// session.Router.UnbindByUID 注释（确定性哈希下只解绑会算回同号）。
+//
+// 与 lock 的区别：eject 是**有时长的避让**，到期自动回归；lock 是**人工终态**，
+// 需显式解锁。运维"这个号现在响应慢，先换掉"用 eject；"这个号别再用"用 lock。
+func (p *Panel) accountEject(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if _, ok := p.cfg.Pool.Status(uid); !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	var body ejectBody
+	if r.Body != nil {
+		// 空体/非法 JSON 不报错（面板发空体）：解析成功才采用字段。
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+	reason := body.Reason
+	if reason == "" {
+		reason = "manual eject (panel)"
+	}
+	d := time.Duration(body.DurationSec) * time.Second
+	if d <= 0 {
+		d = defaultEjectSeconds * time.Second
+	}
+	p.cfg.Pool.Eject(uid, d, reason)
+	unbound := 0
+	if p.cfg.UnbindByUID != nil {
+		unbound = p.cfg.UnbindByUID(uid)
+	}
+	log.Printf("panel: eject uid=%s duration=%s unbound_sessions=%d（人工换号）", uid, d, unbound)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":               true,
+		"unbound_sessions": unbound,
+		"duration_sec":     int(d.Seconds()),
+	})
+}
+
+// accountLock 人工锁定：该号退出选号，直到 unlock（持久化，重启不丢）。
+// 只动 locked 维度、不清冷却 —— 解锁后账号回到锁定前的冷却/健康状态（符合直觉）。
+func (p *Panel) accountLock(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if _, ok := p.cfg.Pool.Status(uid); !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	p.cfg.Pool.Lock(uid, "manual lock (panel)")
+	unbound := 0
+	if p.cfg.UnbindByUID != nil {
+		// 锁定即不可选，绑定在该号上的会话本就无法命中；顺手解绑让下一次请求
+		// 立即重新分配，而不是等快路径校验失败后再走慢路径（少一跳延迟）。
+		unbound = p.cfg.UnbindByUID(uid)
+	}
+	log.Printf("panel: lock uid=%s unbound_sessions=%d（人工锁定）", uid, unbound)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "unbound_sessions": unbound})
+}
+
+// accountUnlock 解除人工锁定。账号无其他冷却/熔断时立即可选并参与会话分配。
+// 未锁定/不存在返回 404（供面板区分"确实解锁了"与"本来就没事"）。
+func (p *Panel) accountUnlock(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if _, ok := p.cfg.Pool.Status(uid); !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if !p.cfg.Pool.Unlock(uid) {
+		writeErr(w, http.StatusNotFound, "account not locked")
+		return
+	}
+	log.Printf("panel: unlock uid=%s（解除人工锁定）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// forceSwitch 一键强制换号：解绑**全部**粘性会话，让所有会话在下一个请求重新分配。
+//
+// 与单号 eject 的适用场景不同：
+//   - 单号 eject："这个号有问题，把它换掉"——针对账号。
+//   - 一键换号："我现在想整体换一批/换开一个"——针对会话，不预设哪个号不好。
+//     典型用法：上游开始对某号限流但还没到熔断，用户想立刻把流量挪开；
+//     或调试时想让所有会话重新洗牌。
+//
+// 实现只做"解绑全部会话"而不做 pool 层避让：因为这里没有"要避开哪个号"的语义，
+// 重分配本身就会按三因子权重重新散列（credits/idle/successRate），于是流量自然
+// 从前一次集中的号散开。若调用方还想顺带把某个具体号推开，用 eject 接口。
+//
+// 额外返回"下一个可用号"作为即时反馈：Pick 会真实占用一个在途名额，故用
+// AuthByUID + AvailableUIDs 的只读口径取 top1，避免为了一次展示而空占租约。
+func (p *Panel) forceSwitch(w http.ResponseWriter, r *http.Request) {
+	// 解绑计数：遍历前先取快照数与各号绑定情况，供响应展示影响面。
+	before := 0
+	if p.cfg.StickyCount != nil {
+		before = p.cfg.StickyCount()
+	}
+	unbound := 0
+	if p.cfg.UnbindByUID != nil {
+		// 按当前池内全部账号逐个解绑（不能只解"有绑定的号"——BoundUIDs 可能为 nil，
+		// 且逐个 uid 解绑的语义比"清空全表"更精确：不动无关账号的绑定）。
+		for _, st := range p.cfg.Pool.List() {
+			unbound += p.cfg.UnbindByUID(st.UID)
+		}
+	} else {
+		// 降级路径：无 session 解绑能力时，一键换号无实际效果（粘性会话仍钉在旧号）。
+		// 明确 501 而不是假装成功——静默成功会让运维以为换号了，实际流量没动。
+		writeErr(w, http.StatusNotImplemented, "session unbind not available (sticky routing disabled?)")
+		return
+	}
+	avail := p.cfg.Pool.AvailableUIDs()
+	nextUID := ""
+	if len(avail) > 0 {
+		nextUID = avail[0]
+	}
+	log.Printf("panel: force switch（一键换号）unbound_sessions=%d available=%d next=%s",
+		unbound, len(avail), nextUID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":               true,
+		"unbound_sessions": unbound,
+		"sticky_before":    before,
+		"available":        len(avail),
+		"next_uid":         nextUID,
+	})
+}
+
+// defaultEjectSeconds 面板「换号」按钮的默认避让时长，与 pool.defaultEjectDuration 对齐。
+// 面板层另立常量而非导出 pool 常量：面板是独立的 API 契约（duration_sec 参数），
+// 其默认值可独立演进；真正兜底仍在 pool.Eject（d<=0 时用池侧默认）。
+const defaultEjectSeconds = 300
 
 // ---------------------------------------------------------------------------
 // 批量任务
