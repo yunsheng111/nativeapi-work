@@ -17,9 +17,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/hostswitch"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -210,11 +212,15 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		// 同风格，面板不直接依赖 session 包。
 		UnbindByUID: unbindByUID,
 		BoundUIDs:   boundUIDs,
-		Version:     AppVersion,
-		Live:        live,
-		ConfigPath:  cfgPath,
-		LoadConfig:  func() (any, error) { return Load(cfgPath) },
-		SaveConfig:  func(raw []byte) ([]string, error) { return SaveConfig(raw, cfgPath, live, p, up, sch) },
+		// 宿主切号：把池内账号写入 WorkBuddy 官方客户端登录态（备份→关客户端→写→重启）。
+		// 备份落在数据目录内；认证文件路径默认用 hostswitch 官方位置，可用
+		// WB_HOST_AUTH_FILE 覆盖（测试注入临时文件 / 便携部署自定义位置）。
+		HostSwitch: hostswitch.NewService(os.Getenv("WB_HOST_AUTH_FILE"), filepath.Join(filepath.Dir(cfg.StateFile), "host-auth-backups")),
+		Version:    AppVersion,
+		Live:       live,
+		ConfigPath: cfgPath,
+		LoadConfig: func() (any, error) { return Load(cfgPath) },
+		SaveConfig: func(raw []byte) ([]string, error) { return SaveConfig(raw, cfgPath, live, p, up, sch) },
 	})
 
 	h := server.NewHandler(server.Config{

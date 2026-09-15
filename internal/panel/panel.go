@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/hostswitch"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -56,6 +57,11 @@ type Config struct {
 	// BoundUIDs 返回每个账号当前绑定的会话数（uid → 条数），供面板展示换号影响面；
 	// nil 时该维度留空（不影响其他功能）。
 	BoundUIDs func() map[string]int
+
+	// HostSwitch 宿主切号服务（写 WorkBuddy 官方客户端登录态文件）；nil 时宿主
+	// 端点返回 501（非 Windows / 显式关闭）。指针直连而非闭包：hostswitch 是
+	// 自包含模块（路径注入 + 无池依赖），与 pool/session 无耦合。
+	HostSwitch *hostswitch.Service
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -156,6 +162,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/lock", p.withAuth(p.accountLock))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/unlock", p.withAuth(p.accountUnlock))
 	p.mux.HandleFunc("POST /panel/api/switch/force", p.withAuth(p.forceSwitch))
+	p.mux.HandleFunc("GET /panel/api/host/current", p.withAuth(p.hostCurrent))
+	p.mux.HandleFunc("POST /panel/api/host/switch", p.withAuth(p.hostSwitch))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))

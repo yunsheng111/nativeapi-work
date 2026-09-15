@@ -4,6 +4,7 @@ const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
+let hostUID = ''; // WorkBuddy 宿主当前登录的账号 uid（host/current 拉取；空 = 未知/未登录）
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
 
@@ -180,6 +181,12 @@ function renderAccounts(list) {
     const lockBtn = s.locked
       ? '<button class="xs primary" data-a="unlock" data-u="' + esc(s.uid) + '" title="解除人工锁定">解锁</button>'
       : '<button class="xs ghost" data-a="lock" data-u="' + esc(s.uid) + '" title="锁定后该号不再被选中；与「禁用」不同，锁定不会被签到/重登自动清除">锁定</button>';
+    // 宿主切号：把该账号写入 WorkBuddy 官方客户端的登录态（会重启客户端）。
+    // 已是宿主的行不再给按钮，改为标记，避免重复操作。
+    const isHost = hostUID && hostUID === s.uid;
+    const hostBtn = isHost
+      ? '<span class="tag ok" title="该账号当前就是 WorkBuddy 客户端登录的账号">宿主</span>'
+      : '<button class="xs ghost" data-a="host" data-u="' + esc(s.uid) + '" title="把该账号设为 WorkBuddy 客户端的登录账号（写入官方认证文件并重启客户端，客户端当前会话会中断）">设为宿主</button>';
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = formatTokenCount(tu.total_tokens);
@@ -207,6 +214,7 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
         lockBtn +
+        hostBtn +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
@@ -247,7 +255,24 @@ async function loadOverview(quiet) {
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
+    loadHostCurrent(); // 异步：不阻塞 overview 渲染
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
+}
+
+// loadHostCurrent 拉取宿主当前登录账号并更新统计位。静默失败（501 = 非 Windows
+// 或未启用；宿主状态不渲染成错误，只是保持 '-'）。
+async function loadHostCurrent() {
+  try {
+    const r = await api('host/current');
+    const c = r.current || {};
+    hostUID = c.file_exists ? (c.uid || '') : '';
+    const nick = c.nickname || (c.uid ? c.uid.slice(0, 8) + '…' : '');
+    $('sHost').textContent = c.file_exists ? (nick || '-') : '未登录';
+    $('sHost').style.color = r.in_pool ? '' : 'var(--warn, #b8860b)';
+    $('sHost').title = c.file_exists
+      ? 'WorkBuddy 客户端当前登录：' + (nick || c.uid || '-') + (r.in_pool ? '（在账号池中）' : '（不在账号池中）')
+      : 'WorkBuddy 客户端尚未登录（认证文件不存在）';
+  } catch (e) { /* 501/网络错误：保持 '-'，不打扰 */ }
 }
 
 $('accBody').addEventListener('click', async ev => {
@@ -258,6 +283,7 @@ $('accBody').addEventListener('click', async ev => {
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。确认禁用？')) return;
   if (a === 'eject' && !confirm('换号会把该账号从选号中推开 5 分钟，并解绑它上面的全部会话（这些会话下一轮会落到其他账号）。确认换号？')) return;
   if (a === 'lock' && !confirm('锁定后该账号不再被选中，且不会被签到/重登自动恢复，需手动解锁。确认锁定？')) return;
+  if (a === 'host' && !confirm('「设为宿主」会把该账号写入 WorkBuddy 官方客户端的登录态文件，并关闭后重启 WorkBuddy——\n客户端里当前打开的会话会中断（包括本面板如果开在客户端里，重启后重新打开即可）。\n当前宿主登录态会先自动备份。确认切换？')) return;
   b.disabled = true;
   try {
     if (a === 'checkin') {
@@ -281,6 +307,10 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'unlock') {
       await api('accounts/' + encodeURIComponent(u) + '/unlock', { method: 'POST' });
       toast('已解锁', 'ok');
+    } else if (a === 'host') {
+      const r = await api('host/switch', { method: 'POST', body: JSON.stringify({ uid: u }) });
+      const res = r.result || {};
+      toast('宿主已切换为该账号' + (res.launched_workbuddy ? '，WorkBuddy 已重启' : '（请手动启动 WorkBuddy）') + (res.backup ? '。备份：' + res.backup : ''), 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
     } else if (a === 'remove') {
