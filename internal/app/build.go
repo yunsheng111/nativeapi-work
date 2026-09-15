@@ -196,9 +196,25 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 	// 闭包留 nil 让面板的 switch/force 明确返回 501，而不是假装成功）。
 	var unbindByUID func(string) int
 	var boundUIDs func() map[string]int
+	var listBindings func() []panel.SessionBinding
+	var rebindSession func(id, uid string) int
+	var bindAllSessions func(uid string) int
 	if sessRouter != nil {
 		unbindByUID = sessRouter.UnbindByUID
 		boundUIDs = sessRouter.BoundUIDs
+		// 会话视图：结构转换放装配层，面板只认自己的投影类型（不引入 session 包）。
+		listBindings = func() []panel.SessionBinding {
+			bs := sessRouter.Bindings()
+			out := make([]panel.SessionBinding, 0, len(bs))
+			for _, b := range bs {
+				out = append(out, panel.SessionBinding{
+					ID: b.ID, UID: b.UID, Kind: b.Kind, AgeSec: b.AgeSec, TTLRemain: b.TTLRemain,
+				})
+			}
+			return out
+		}
+		rebindSession = sessRouter.RebindByID
+		bindAllSessions = sessRouter.BindAllTo
 	}
 	pn := panel.New(panel.Config{
 		Pool:        p,
@@ -212,6 +228,10 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		// 同风格，面板不直接依赖 session 包。
 		UnbindByUID: unbindByUID,
 		BoundUIDs:   boundUIDs,
+		// 会话视图：绑定列表 / 单会话改绑 / 全量收编，与换号（eject）互补。
+		ListBindings:    listBindings,
+		RebindSession:   rebindSession,
+		BindAllSessions: bindAllSessions,
 		// 宿主切号：把池内账号写入 WorkBuddy 官方客户端登录态（备份→关客户端→写→重启）。
 		// 备份落在数据目录内；认证文件路径默认用 hostswitch 官方位置，可用
 		// WB_HOST_AUTH_FILE 覆盖（测试注入临时文件 / 便携部署自定义位置）。

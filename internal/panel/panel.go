@@ -57,6 +57,12 @@ type Config struct {
 	// BoundUIDs 返回每个账号当前绑定的会话数（uid → 条数），供面板展示换号影响面；
 	// nil 时该维度留空（不影响其他功能）。
 	BoundUIDs func() map[string]int
+	// ListBindings 返回粘性会话绑定快照（脱敏 ID），供「会话」视图；nil 时该端点 501。
+	ListBindings func() []SessionBinding
+	// RebindSession 把指定会话改绑到账号，返回命中条数（0 = 会话不存在/已过期）。
+	RebindSession func(id, uid string) int
+	// BindAllSessions 把全部会话改绑到账号（「全部会话切到此号」）。
+	BindAllSessions func(uid string) int
 
 	// HostSwitch 宿主切号服务（写 WorkBuddy 官方客户端登录态文件）；nil 时宿主
 	// 端点返回 501（非 Windows / 显式关闭）。指针直连而非闭包：hostswitch 是
@@ -162,6 +168,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/lock", p.withAuth(p.accountLock))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/unlock", p.withAuth(p.accountUnlock))
 	p.mux.HandleFunc("POST /panel/api/switch/force", p.withAuth(p.forceSwitch))
+	p.mux.HandleFunc("GET /panel/api/sessions", p.withAuth(p.sessionsList))
+	p.mux.HandleFunc("POST /panel/api/sessions/rebind", p.withAuth(p.sessionRebind))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/adopt_sessions", p.withAuth(p.accountAdoptSessions))
 	p.mux.HandleFunc("GET /panel/api/host/current", p.withAuth(p.hostCurrent))
 	p.mux.HandleFunc("POST /panel/api/host/switch", p.withAuth(p.hostSwitch))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))

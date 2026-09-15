@@ -3,7 +3,7 @@
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
-let overviewData = null, cfgLoaded = null;
+let overviewData = null, cfgLoaded = null, lastUID = '', sessData = null;
 let hostUID = ''; // WorkBuddy 宿主当前登录的账号 uid（host/current 拉取；空 = 未知/未登录）
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
@@ -127,12 +127,13 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', sessions: '会话', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
+  if (v === 'sessions') loadSessions();
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
@@ -145,7 +146,7 @@ go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accou
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -196,7 +197,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.recent ? ' <span class="tag acc" title="最近一次请求落在这个号">最近</span>' : '') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred" title="' + credTip + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -208,6 +209,7 @@ function renderAccounts(list) {
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
+      '<td class="num">' + (boundExact(s.uid) > 0 ? '<span class="tag acc" title="该号当前挂着的粘性会话数">' + boundExact(s.uid) + '</span>' : '<span class="tag mute">0</span>') + '</td>' +
       '<td class="acts">' +
         ejectBtn +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
@@ -229,6 +231,13 @@ function boundCount(uid) {
   const m = overviewData && overviewData.bound_uids;
   if (!m || m[uid] == null) return 1;
   return m[uid];
+}
+
+// boundExact 与 boundCount 不同：列显示用，缺失即 0——保守值 1 只适合"点击前提示影响面"，
+// 用作列显示会凭空多出一个会话。
+function boundExact(uid) {
+  const m = overviewData && overviewData.bound_uids;
+  return (m && m[uid]) || 0;
 }
 
 async function loadOverview(quiet) {
@@ -254,6 +263,22 @@ async function loadOverview(quiet) {
     $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
+    // 最近请求（B）：取各号 token_usage.last_used_at 的最大者。不用日志文本解析——
+    // last_used_at 是每次尝试（含失败）都会刷新的结构化时间戳，与"这一跳用了谁"同源。
+    const accts = d.accounts || [];
+    let bestTs = 0;
+    lastUID = '';
+    accts.forEach(s => {
+      const ts = Date.parse((s.token_usage || {}).last_used_at || '') || 0;
+      if (ts > bestTs) { bestTs = ts; lastUID = s.uid; }
+    });
+    accts.forEach(s => { s.recent = s.uid === lastUID; });
+    const la = accts.find(s => s.uid === lastUID);
+    if (la && bestTs) {
+      const nick = la.nickname || lastUID.slice(0, 8) + '…';
+      $('sLastChat').textContent = nick + ' · ' + ago((la.token_usage || {}).last_used_at);
+      $('sLastChat').title = '最近一次对话请求落在：' + nick + '（' + lastUID + '）';
+    } else { $('sLastChat').textContent = '-'; }
     renderAccounts(d.accounts || []);
     loadHostCurrent(); // 异步：不阻塞 overview 渲染
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
@@ -943,3 +968,85 @@ function startQueuePolling() {
     } catch (e) { /* 忽略 */ }
   }, 3000);
 }
+
+/* ── 会话（C）────────────────────────────────────────────────────── */
+/* 粘性会话挂在哪个账号上，可单条改绑 / 全量收编。与「换号」（eject）互补：
+   eject 是把账号推开被动等会话漂走；这里是主动指定"这条会话下一跳走谁"。 */
+function fmtAge(sec) {
+  if (sec == null) return '—';
+  if (sec < 60) return sec + ' 秒前';
+  if (sec < 3600) return Math.floor(sec / 60) + ' 分钟前';
+  return Math.floor(sec / 3600) + ' 小时前';
+}
+function fmtTTL(sec) {
+  if (sec == null) return '—';
+  if (sec <= 0) return '即将过期';
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm';
+  return Math.floor(sec / 3600) + 'h';
+}
+async function loadSessions() {
+  const tb = $('sessBody');
+  try {
+    const d = await api('sessions');
+    sessData = d;
+    const accounts = d.accounts || [];
+    const sel = $('sessTarget');
+    const prev = sel.value;
+    sel.innerHTML = accounts.map(a => '<option value="' + esc(a.uid) + '">' +
+      esc(a.nickname || a.uid.slice(0, 8) + '…') + (a.available ? '' : '（不可用）') + '</option>').join('');
+    if (prev && accounts.some(a => a.uid === prev)) sel.value = prev;
+    const list = d.bindings || [];
+    $('sessHint').textContent = list.length
+      ? list.length + ' 条绑定 · 同一对话尽量固定在同一个账号'
+      : '当前没有粘性绑定（客户端发出带会话 id 的请求后才会建立）';
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="7"><div class="empty"><div class="big">没有粘性会话</div>客户端带 conversationId 的请求会在网关侧建立"会话 → 账号"绑定</div></td></tr>';
+      return;
+    }
+    const nick = k => { const a = accounts.find(x => x.uid === k); return a ? (a.nickname || k.slice(0, 8) + '…') : k.slice(0, 8) + '…'; };
+    tb.innerHTML = list.map(b => {
+      const opts = accounts.map(a => '<option value="' + esc(a.uid) + '"' + (a.uid === b.uid ? ' selected' : '') + '>' +
+        esc(a.nickname || a.uid.slice(0, 8)) + (a.available ? '' : '（不可用）') + '</option>').join('');
+      return '<tr title="会话哈希 ' + esc(b.id) + '">' +
+        '<td class="mark" aria-hidden="true"><i></i></td>' +
+        '<td class="who"><div class="nm" style="font-family:var(--mono);font-size:12.5px">' + esc(b.id) + '</div></td>' +
+        '<td>' + (b.kind === 'derived'
+          ? '<span class="tag mute" title="客户端未提供会话 id，按 system + 首条用户消息派生">派生</span>'
+          : '<span class="tag acc">对话 id</span>') + '</td>' +
+        '<td>' + esc(nick(b.uid)) + '</td>' +
+        '<td class="num" style="color:var(--ink-3)">' + fmtAge(b.age_sec) + '</td>' +
+        '<td class="num" style="color:var(--ink-3)">' + fmtTTL(b.ttl_remain_sec) + '</td>' +
+        '<td class="acts"><select data-sel="' + esc(b.id) + '">' + opts + '</select>' +
+          '<button class="xs" data-a="rebind" data-s="' + esc(b.id) + '">切到此号</button></td>' +
+      '</tr>';
+    }).join('');
+  } catch (e) {
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+  }
+}
+$('sessBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-a="rebind"]');
+  if (!b) return;
+  const id = b.dataset.s;
+  const sel = $('sessBody').querySelector('select[data-sel="' + id + '"]');
+  const uid = sel ? sel.value : '';
+  if (!uid) return;
+  b.disabled = true;
+  try {
+    const r = await api('sessions/rebind', { method: 'POST', body: JSON.stringify({ id: id, uid: uid }) });
+    toast('已切换 ' + r.rebound + ' 条绑定' + (r.target_available ? '' : '（目标号当前不可用，会先落到别的号）'), 'ok');
+    loadSessions(); loadOverview(true);
+  } catch (e) { toast(e.message, 'err'); } finally { b.disabled = false; }
+});
+$('btnSessRefresh').onclick = () => { loadSessions(); loadOverview(true); };
+$('btnAdoptAll').onclick = async () => {
+  const uid = $('sessTarget').value;
+  if (!uid) return;
+  if (!confirm('把当前所有粘性会话都改绑到该账号？\n之后每个会话的下一跳都走它；目标号冷却/锁定/占满时会话会再次漂移。\n（新会话仍按权重分配，要整池只走它请锁定其它号。）')) return;
+  try {
+    const r = await api('accounts/' + encodeURIComponent(uid) + '/adopt_sessions', { method: 'POST' });
+    toast('已改绑 ' + r.bound + ' 条会话' + (r.target_available ? '' : '（目标号当前不可用）'), 'ok');
+    loadSessions(); loadOverview(true);
+  } catch (e) { toast(e.message, 'err'); }
+};

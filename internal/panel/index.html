@@ -265,6 +265,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.bad { background: var(--bad-soft); color: var(--bad); }
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
+.tag.acc { background: var(--accent-soft); color: var(--accent); }
+#sessTarget { background: var(--surface-2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-size: 12.5px; }
 .acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
 .acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
 
@@ -348,6 +350,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#accounts" data-view="accounts" class="on">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>
         账号池</a></li>
+      <li><a href="#sessions" data-view="sessions">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 3.2h11v7.2H8.2L5.5 13v-2.6H2.5z"/><path d="M5.5 6.6h5"/></svg>
+        会话</a></li>
       <li><a href="#taskscenter" data-view="taskscenter">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
         任务中心</a></li>
@@ -389,6 +394,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
+        <div class="stat"><div class="v" id="sLastChat" style="font-size:14px">-</div><div class="k" title="最近一次对话请求命中的账号（取各号最近使用时间的最大值）">最近请求</div></div>
         <div class="stat"><div class="v" id="sHost" style="font-size:14px">-</div><div class="k" title="WorkBuddy 官方客户端当前登录的账号；可用账号行的「设为宿主」一键切换">宿主账号</div></div>
       </div>
 
@@ -408,9 +414,31 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
             <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
+            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th>会话</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 会话：粘性会话挂在哪个账号上 -->
+    <section class="view" id="view-sessions" hidden>
+      <div class="box">
+        <header>
+          <h3>粘性会话 <span class="hint" id="sessHint"></span></h3>
+          <span class="grow"></span>
+          <select id="sessTarget"></select>
+          <button class="xs" id="btnAdoptAll" title="把当前所有粘性会话改绑到所选账号">全部切到此号</button>
+          <button class="xs" id="btnSessRefresh">刷新</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th class="mark" aria-hidden="true"></th>
+            <th>会话</th><th>来源</th><th>绑定账号</th><th>最后活跃</th><th>剩余</th><th class="c-acts"></th>
+          </tr></thead>
+          <tbody id="sessBody"></tbody>
         </table>
         </div>
       </div>

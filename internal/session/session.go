@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -292,6 +293,109 @@ func (r *Router) Count() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.entries)
+}
+
+// Binding 一条粘性绑定的对外投影（面板「会话」视图用）。
+//
+// 为什么给 ID 而不是原始会话键：键可能是客户端对话 id（metadata.conversation_id）
+// 或内容派生哈希，属于用户隐私面，不该下发到浏览器；对外只给键的短哈希，
+// 需要按会话操作时由服务端用 ID 反查（见 RebindByID）。
+type Binding struct {
+	ID        string `json:"id"`             // 会话键短哈希
+	UID       string `json:"uid"`            // 当前绑定的账号
+	Kind      string `json:"kind"`           // conversation（客户端给的 id）| derived（内容派生）
+	AgeSec    int64  `json:"age_sec"`        // 距最后一次真实活跃的秒数
+	TTLRemain int64  `json:"ttl_remain_sec"` // 绑定剩余存活时间；<=0 表示下轮 GC 清理
+}
+
+// keyIDLen 会话键短哈希字节数（10 字节 = 20 hex；对内存级会话表碰撞概率可忽略）。
+const keyIDLen = 10
+
+// keyID 会话键的稳定短标识（SHA-256 前 keyIDLen 字节，无盐——面板按 ID 回查要靠它确定）。
+func keyID(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:keyIDLen])
+}
+
+// keyKind 归类会话键来源，让面板能区分"客户端带 id 的对话"与"按内容派生的会话"。
+func keyKind(key string) string {
+	if strings.HasPrefix(key, derivedKeyPrefix) {
+		return "derived"
+	}
+	return "conversation"
+}
+
+// Bindings 返回全部粘性绑定的脱敏快照（按最近活跃降序）。
+// 此前面板只有各号的计数（BoundUIDs），看不出"我正在用的这条对话钉在谁身上"。
+func (r *Router) Bindings() []Binding {
+	now := time.Now()
+	r.mu.RLock()
+	out := make([]Binding, 0, len(r.entries))
+	for key, e := range r.entries {
+		out = append(out, Binding{
+			ID:        keyID(key),
+			UID:       e.uid,
+			Kind:      keyKind(key),
+			AgeSec:    int64(now.Sub(e.lastActive).Seconds()),
+			TTLRemain: int64((r.cfg.TTL - now.Sub(e.lastActive)).Seconds()),
+		})
+	}
+	r.mu.RUnlock()
+	// 排序在锁外：快照已拷贝，不触碰共享状态。
+	sort.Slice(out, func(i, j int) bool { return out[i].AgeSec < out[j].AgeSec })
+	return out
+}
+
+// RebindByID 把 ID 对应会话改绑到 uid，返回命中条数（0 = 会话不存在/已过期）。
+//
+// 与 handler 成功回绑（Bind）的分工：那个持有原始键；本方法只有脱敏 ID，需要反查，
+// 所以 keyID 必须是确定性的。
+//
+// 语义边界（必须让调用方知道，与 eject/lock 的区别）：改绑只改"这条会话下一跳走谁"，
+// 不改变账号可用性；目标号随后冷却/锁定/占满时，快路径校验会让会话再次漂移
+// （ResolveForModel 的既定行为）。要"钉死不走别的号"，需配合 lock 其它号。
+//
+// 这里**不刷新 lastActive**：活跃时间与 TTL 应反映真实请求活动，人工改绑不产生流量，
+// 伪造它会让「最后活跃」失真、并让本该过期的绑定续命。
+func (r *Router) RebindByID(id, uid string) int {
+	if id == "" || uid == "" {
+		return 0
+	}
+	r.mu.Lock()
+	var keys []string
+	for key, e := range r.entries {
+		if keyID(key) == id {
+			e.uid = uid
+			r.entries[key] = e
+			keys = append(keys, key)
+		}
+	}
+	r.mu.Unlock()
+	for _, key := range keys {
+		r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	}
+	return len(keys)
+}
+
+// BindAllTo 把现有全部绑定统一指向 uid（面板「全部会话切到此号」），返回条数。
+// 只动粘性锚点：新会话（尚无绑定的）仍按双段哈希分配，所以它不是"全网关只走一个号"的
+// 开关——那个语义要用 lock 其它号实现。同样不刷新 lastActive。
+func (r *Router) BindAllTo(uid string) int {
+	if uid == "" {
+		return 0
+	}
+	r.mu.Lock()
+	keys := make([]string, 0, len(r.entries))
+	for key, e := range r.entries {
+		e.uid = uid
+		r.entries[key] = e
+		keys = append(keys, key)
+	}
+	r.mu.Unlock()
+	for _, key := range keys {
+		r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	}
+	return len(keys)
 }
 
 // gcOnce 清理 TTL 过期的绑定，并镜像删除。
