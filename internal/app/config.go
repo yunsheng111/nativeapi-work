@@ -1,5 +1,11 @@
-// config.go 加载 JSON 配置 + 环境变量覆盖。
-package main
+// Package app 网关的配置加载与装配（Build）：被 cmd/server（命令行/服务端）
+// 与 cmd/desktop（WebView2 桌面端）共用。
+//
+// 为什么独立成包：cmd/server 是 package main，Go 不允许被 import，桌面端无法
+// 复用其中的配置与装配逻辑。此前两处各自维护曾导致"服务端改了、桌面端没跟上"
+// 的漂移风险，故把配置与装配收拢到本包，两个入口只剩薄壳差异
+// （命令行等信号 vs 开窗口 + 关窗即停）。
+package app
 
 import (
 	"crypto/rand"
