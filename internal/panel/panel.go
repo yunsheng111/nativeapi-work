@@ -29,6 +29,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
 // Config 面板依赖（main 装配注入）。
@@ -87,6 +88,14 @@ type Config struct {
 	// 免重新编译），空 = 生产模式用 go:embed 内容。仅由环境变量 WB2API_PANEL_DEV 注入，
 	// 正常部署不设置。
 	DevDir string
+
+	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
+	Usage *usage.Recorder
+
+	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
+	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
+	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
+	ProbeFile string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -229,11 +238,16 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
 	p.mux.HandleFunc("GET /panel/api/school/status", p.withAuth(p.schoolStatus))
 	p.mux.HandleFunc("POST /panel/api/school/run_all", p.withAuth(p.schoolRunAll))
+	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
+	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
+	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
+	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
@@ -489,19 +503,42 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(infos))
 	for _, mi := range infos {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"id":                   mi.ID,
 			"name":                 mi.Name,
-			"context_length":       mi.ContextWindow,
-			"max_output_tokens":    mi.MaxTokens,
-			"max_allowed_size":     mi.MaxAllowedSize,
 			"default_effort":       mi.DefaultEffort,
 			"supported_efforts":    mi.Efforts,
 			"can_disable_thinking": mi.CanDisableThinking,
 			"supports_reasoning":   mi.SupportsReasoning,
 			"supports_images":      mi.SupportsImages,
 			"credits":              mi.Credits,
-		})
+			"description":          mi.Description,
+			"tags":                 mi.Tags,
+			"vendor":               mi.Vendor,
+			"is_default":           mi.IsDefault,
+			"supports_tool_call":   mi.SupportsToolCall,
+			"only_reasoning":       mi.OnlyReasoning,
+			"reasoning_effort":     mi.ReasoningEffort,
+			"reasoning_summary":    mi.ReasoningSummary,
+		}
+		if mi.MaxAllowedSize > 0 {
+			entry["max_allowed_size"] = mi.MaxAllowedSize
+		}
+		// 与 /v1/models 同口径：context_length / max_output_tokens 走四级查找链
+		// （上游动态值 → 静态知识表 → model.json → models.dev → 1M 兜底），
+		// effort 档位走 EffortListing（远端权威 ∪ CN 静态兜底表）——面板展示的
+		// 数值即客户端实际拿到的数值，两侧不再漂移。
+		entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, p.cfg.Upstream.HTTP)
+		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, p.cfg.Upstream.HTTP); ok {
+			entry["max_output_tokens"] = mo
+		}
+		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+			entry["supported_efforts"] = efforts
+			if def != "" {
+				entry["default_effort"] = def
+			}
+		}
+		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
@@ -567,6 +604,46 @@ func (p *Panel) modelsAll(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(ids)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": ids, "accounts_queried": okN, "accounts_total": len(list)})
+}
+
+// modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out
+// 写入的契约文件），供前端在「模型与档位」的实测列做风险标注。
+//
+// 设计边界：纯只读透传——文件缺失/未配置返回空集（面板退化为无标注，与历史行为
+// 一致），网关自身不解析字段语义、不据此做任何路由或出站决策；上游改了限制后
+// 重跑一次工具、下次查询即刷新，无需重启网关。
+func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{"probes": map[string]json.RawMessage{}, "exists": false}
+	if p.cfg.ProbeFile == "" {
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	raw, err := os.ReadFile(p.cfg.ProbeFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "read probes: "+err.Error())
+		return
+	}
+	var f struct {
+		Version int                        `json:"version"`
+		Probes  map[string]json.RawMessage `json:"probes"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		writeErr(w, http.StatusBadGateway, "parse probes: "+err.Error())
+		return
+	}
+	if f.Probes == nil {
+		f.Probes = map[string]json.RawMessage{}
+	}
+	out["probes"] = f.Probes
+	out["exists"] = true
+	if fi, err := os.Stat(p.cfg.ProbeFile); err == nil {
+		out["updated_at"] = fi.ModTime().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -869,6 +946,94 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// usage 返回逐请求用量聚合。hours 查询参数控制小时粒度时序窗口（默认 72，
+// 上限 1440=60 天）；更早的数据自动折叠为日点，因此长期趋势不会丢。
+func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Usage == nil {
+		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
+		return
+	}
+	hours := 72
+	if v := r.URL.Query().Get("hours"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
+	if hours > 1440 {
+		hours = 1440
+	}
+	// 昵称仅用于展示，取自池快照（不含任何凭证）。
+	nicks := map[string]string{}
+	for _, s := range p.cfg.Pool.List() {
+		if s.Nickname != "" {
+			nicks[s.UID] = s.Nickname
+		}
+	}
+	writeJSON(w, http.StatusOK, p.cfg.Usage.Snapshot(hours, nicks))
+}
+
+// usageSave 立即把内存中的用量桶落盘（正常由后台 30s 防抖刷新负责）。
+func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Usage == nil {
+		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
+		return
+	}
+	p.cfg.Usage.Save()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// packages 返回全部账号的积分包构成，供「积分构成」视图对比。
+//
+// 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
+// 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
+func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
+	accts := p.cfg.Pool.List()
+	type row struct {
+		UID      string                   `json:"uid"`
+		Nickname string                   `json:"nickname"`
+		Realm    string                   `json:"realm"`
+		Remain   int64                    `json:"remain"`
+		Size     int64                    `json:"size"`
+		Packages []upstream.CreditPackage `json:"packages"`
+		Error    string                   `json:"error,omitempty"`
+	}
+	out := make([]row, len(accts))
+
+	sem := make(chan struct{}, 3)
+	var wg sync.WaitGroup
+	for i, s := range accts {
+		wg.Add(1)
+		go func(i int, s pool.Status) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+			a := p.cfg.Pool.AuthByUID(s.UID)
+			if a == nil {
+				it.Error = "account not loaded"
+				out[i] = it
+				return
+			}
+			packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
+			if err != nil {
+				it.Error = err.Error()
+				out[i] = it
+				return
+			}
+			it.Packages = packs
+			it.Remain = remain
+			it.Size = size
+			out[i] = it
+		}(i, s)
+	}
+	wg.Wait()
+
+	// 余额降序：多的在前，便于和少的对比。
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)

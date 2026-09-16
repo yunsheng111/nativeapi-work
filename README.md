@@ -306,7 +306,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
-| `server.max_body_mb` | `8` | 聊天请求体大小上限（MB，0 / 负数启动报错）。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游 |
+| `server.max_body_mb` | `8` | 聊天请求体大小上限（MB，0 / 负数启动报错）。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游。**面板在线修改即时生效** |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
@@ -328,6 +328,9 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `prompt.file` | 空 | 提示词文件路径；空 = 内置默认（约 2KB）；路径非空但不可读 → 启动报错 |
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
+| `pool.max_in_flight_global` | `2` | global 域单账号在途上限（国际版 WAF 风控更紧，压低并发） |
+| `pool.degrade_threshold` | `5` | 连败降权阈值：未知错误（ErrClient/传输层）连败 N 次临时出池 |
+| `pool.degrade_cooldown` / `pool.degrade_cooldown_max` | `10m` / `2h` | 连败降权时长与封顶 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `pool.breaker_cooldown` | `30m` | 熔断基础退避时长 |
 | `pool.breaker_cooldown_max` | `6h` | 熔断指数退避封顶 |
@@ -493,7 +496,7 @@ http://127.0.0.1:7863/panel/
 | **账号池** | 统计条（总数/可用/冷却/禁用/可用积分合计/粘性会话）+ 账号表：状态标签（可用/限流冷却/积分冷却/熔断/已禁用）、积分量条、成功失败计数、在途、单号操作（签到/余额/任务/解冻/禁用/移除）；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」 |
 | **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启** |
 | **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
-| **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出 |
+| **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」） |
 | **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关 |
 | **运行日志** | 最近 500 行服务日志 + 请求表格日志（可开关自动滚动） |
 
@@ -518,7 +521,7 @@ http://127.0.0.1:7863/panel/
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存）；每模型带 `supported_efforts`/`default_effort` 实际思考档位（上游有返回时） |
+| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
 
@@ -616,8 +619,36 @@ http://127.0.0.1:7863/panel/
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
 | `python3 scripts/probe_active.py` | 活跃上报手动诊断 / 补跑（probe=只读 / report=单号上报 / unlock=单号领猫 / ALL=全池；写操作默认 dry-run，需 `--yes`） |
+| `python3 scripts/probe_max_tokens.py` | 探测各模型**真实输出上限**（区分静默钳制与模型主动收尾），`--panel-out` 结果可直接进面板展示（见下节） |
 
 二进制不在 git 中：脚本首次使用自动 `go build` 对应 `cmd/*`（Docker 镜像内已预编译）。
+
+### 探测模型真实输出上限
+
+上游 `/v3/config` 里的 `max_output_tokens` 是**声称值**，普遍虚高：实测 16 个 CN 模型中 8 个被
+**静默钳制**（请求 `max_tokens` 更大也不报错，输出到真实上限即截断），最狠的声称 1M 实际 32K。
+「模型与档位」视图因此支持在最大输出列叠加**实测标注**：
+
+- 🔴 `32K ⚠ 钳制 12×` —— 实测被截断于 32K，声称值的 1/12（`finish=length` 判据，可信）
+- 🟢 `48K ✓ / 64K ↑` —— 实测与声称一致 / 实际比声称更大
+- ⚪ `≥40K` / `?` —— 满额未触顶（下界）/ 模型主动收尾未测出
+
+实测值**不写死在代码里**——它来自探测工具写入的数据文件，上游调整后重跑一次即自动刷新：
+
+```bash
+# 在网关所在机器上（探测会真实消耗积分；单模型预算默认 600s，并行 4）
+python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-xxx   --panel-out data/output_probes.json
+
+# 断点续测 / 只测指定模型 / 预览计划
+... --resume
+... --models cn:glm-5.2 --panel-out data/output_probes.json
+... --dry-run
+```
+
+文件落在 state 文件同目录（默认 `data/output_probes.json`，`data/` 已被 gitignore），面板
+`GET /panel/api/model_probes` 只读透传，写入后**下次查询即生效，无需重启网关**；未探测的
+模型不受影响。探测判据（两种停止的区分 / 提示词量级匹配 / 并行与时间预算）的设计细节
+见脚本头部注释。
 
 ### 账号管理
 
@@ -669,11 +700,13 @@ http://127.0.0.1:7863/panel/
 请求体超过 `server.max_body_mb`（默认 8 MB）时网关直接返回 `413 request_body_too_large`：
 
 ```json
-{"error":{"message":"请求体超过 8 MB 上限：请压缩内容或调大 server.max_body_mb 配置后重试","type":"api_error","code":"request_body_too_large"}}
+{"error":{"message":"请求体超过 8 MB 上限：多图/长上下文会话易触发（历史图片每轮以 base64 重发）；请压缩图片或调大 server.max_body_mb（面板修改即时生效）后重试","type":"api_error","code":"request_body_too_large"}}
 ```
 
-- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转
-- 收到 `413` 即表示是请求体本身超限（多图 / 超长上下文场景），调大 `server.max_body_mb` 即可（`WB2A_MAX_BODY_MB` 环境变量同样生效）
+- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转——**这不是 WorkBuddy 上游的限制**，是网关自身的默认上限
+- 为什么多图容易触发：客户端（Claude Code / Codex / ZCode 等 agent）每轮都会把**历史全部图片**以 base64 重新塞进请求体（编码再膨胀约 37%），几张 MB 级截图叠两三轮就会破 8 MB
+- 收到 `413` 即表示是请求体本身超限：面板「配置 → 请求体上限」在线调大**保存后即时生效，无需重启**（issue #17）；直接改 `config.json` 或设 `WB2A_MAX_BODY_MB` 环境变量则需要重启进程
+- 上游真实上限未实测（8 MB 以上的请求从未穿过网关），建议按需调大（如 16 / 32），若上游回 413 再回调
 - 要么放行要么明确 `413`，网关不再把半截请求体喂给上游
 
 ### Docker 部署登录后报「写入 auths/…json.tmp 失败： permission denied」？

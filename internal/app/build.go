@@ -28,12 +28,13 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // AppVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const AppVersion = "1.9.0-panel"
+const AppVersion = "1.11.0-panel"
 
 // Instance 一个已装配、尚未开始服务的网关实例。
 // 入口拿到它之后自行决定如何服务（ListenAndServe 等信号 / 开 WebView2 窗口），
@@ -51,6 +52,7 @@ type Instance struct {
 	sessRouter *session.Router
 	live       *livecfg.Holder
 	reqlog     *panel.ReqLog
+	usageRec   *usage.Recorder
 	schedCtx   context.Context
 	schedStop  context.CancelFunc
 }
@@ -107,9 +109,12 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
-	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
+	// 熔断器 + 在途上限（含 global 分档）+ 连败降权 + 三因子加权调优（从 config 注入，
+	// 非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
+	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域 WAF 风控分档（P1-1）
+	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 
@@ -253,6 +258,12 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 	// 桌面端 main 已把 CWD 锚到 exe 目录，服务端与数据目录同源。
 	reqlog := panel.NewReqLog("logs")
 
+	// 逐请求用量记录器（上游「用量」视图数据源）：与 state 文件同目录（state_file
+	// 配置搬移时数据跟着走），小时桶折叠日桶长期保留，30s 防抖落盘、重启不丢。
+	// 与 ReqLog（24h 请求明细）互补：一个管长期聚合趋势，一个管逐请求筛选回放。
+	rec := usage.New(stateSibling(cfg.StateFile, "usage.json"))
+	rec.Start()
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Upstream:    up,
@@ -281,6 +292,10 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		HostSwitch: hostswitch.NewService(os.Getenv("WB_HOST_AUTH_FILE"), filepath.Join(filepath.Dir(cfg.StateFile), "host-auth-backups")),
 		Version:    AppVersion,
 		ReqLog:     reqlog,
+		// 逐请求用量聚合 + 模型输出上限探测文件（scripts/probe_max_tokens.py 写入，
+		// 面板只读展示）。
+		Usage:      rec,
+		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		Live:       live,
 		ConfigPath: cfgPath,
 		LoadConfig: func() (any, error) { return Load(cfgPath) },
@@ -297,6 +312,7 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		SoftCooldown: cfg.SoftRateDur,
 		Panel:        pn,
 		Live:         live,
+		Usage:        rec,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
@@ -314,6 +330,7 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		sessRouter: sessRouter,
 		live:       live,
 		reqlog:     reqlog,
+		usageRec:   rec,
 	}
 	// 日志镜像延迟到实例构建完成后接线：让装配期的日志也能进面板缓冲。
 	inst.StartLogMirror()
@@ -389,6 +406,20 @@ func (i *Instance) Close() {
 	if i.reqlog != nil {
 		i.reqlog.Close()
 	}
+	if i.usageRec != nil {
+		i.usageRec.Stop() // 停防抖落盘协程并立即刷一次余量（用量桶不丢尾巴）
+	}
+}
+
+// stateSibling 返回与 state 文件同目录的指定文件名路径（相对路径场景回落当前目录）。
+// usage.json（用量记录）与 output_probes.json（模型上限探测）共用本规则：config 里
+// 改 state_file 时数据文件跟着走，不需要额外配置项。
+func stateSibling(stateFile, name string) string {
+	dir := filepath.Dir(stateFile)
+	if dir == "" || dir == "." {
+		return name
+	}
+	return filepath.Join(dir, name)
 }
 
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL
@@ -497,6 +528,8 @@ func SaveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
+	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal) // global 域在途分档热生效
+	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	sch.Reconfigure(
