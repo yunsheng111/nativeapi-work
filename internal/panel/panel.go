@@ -29,7 +29,6 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
 // Config 面板依赖（main 装配注入）。
@@ -88,9 +87,6 @@ type Config struct {
 	// 免重新编译），空 = 生产模式用 go:embed 内容。仅由环境变量 WB2API_PANEL_DEV 注入，
 	// 正常部署不设置。
 	DevDir string
-
-	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
-	Usage *usage.Recorder
 
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
@@ -245,8 +241,6 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
-	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
-	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
@@ -941,46 +935,6 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Scheduler.RunBalanceRefreshNow()
 	log.Printf("panel: 手动全量余额刷新完成")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
-}
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-// usage 返回逐请求用量聚合。hours 查询参数控制小时粒度时序窗口（默认 72，
-// 上限 1440=60 天）；更早的数据自动折叠为日点，因此长期趋势不会丢。
-func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Usage == nil {
-		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
-		return
-	}
-	hours := 72
-	if v := r.URL.Query().Get("hours"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			hours = n
-		}
-	}
-	if hours > 1440 {
-		hours = 1440
-	}
-	// 昵称仅用于展示，取自池快照（不含任何凭证）。
-	nicks := map[string]string{}
-	for _, s := range p.cfg.Pool.List() {
-		if s.Nickname != "" {
-			nicks[s.UID] = s.Nickname
-		}
-	}
-	writeJSON(w, http.StatusOK, p.cfg.Usage.Snapshot(hours, nicks))
-}
-
-// usageSave 立即把内存中的用量桶落盘（正常由后台 30s 防抖刷新负责）。
-func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Usage == nil {
-		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
-		return
-	}
-	p.cfg.Usage.Save()
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // packages 返回全部账号的积分包构成，供「积分构成」视图对比。

@@ -28,13 +28,12 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // AppVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const AppVersion = "1.11.0-panel"
+const AppVersion = "1.11.1-panel"
 
 // Instance 一个已装配、尚未开始服务的网关实例。
 // 入口拿到它之后自行决定如何服务（ListenAndServe 等信号 / 开 WebView2 窗口），
@@ -52,7 +51,6 @@ type Instance struct {
 	sessRouter *session.Router
 	live       *livecfg.Holder
 	reqlog     *panel.ReqLog
-	usageRec   *usage.Recorder
 	schedCtx   context.Context
 	schedStop  context.CancelFunc
 }
@@ -258,12 +256,6 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 	// 桌面端 main 已把 CWD 锚到 exe 目录，服务端与数据目录同源。
 	reqlog := panel.NewReqLog("logs")
 
-	// 逐请求用量记录器（上游「用量」视图数据源）：与 state 文件同目录（state_file
-	// 配置搬移时数据跟着走），小时桶折叠日桶长期保留，30s 防抖落盘、重启不丢。
-	// 与 ReqLog（24h 请求明细）互补：一个管长期聚合趋势，一个管逐请求筛选回放。
-	rec := usage.New(stateSibling(cfg.StateFile, "usage.json"))
-	rec.Start()
-
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Upstream:    up,
@@ -292,9 +284,7 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		HostSwitch: hostswitch.NewService(os.Getenv("WB_HOST_AUTH_FILE"), filepath.Join(filepath.Dir(cfg.StateFile), "host-auth-backups")),
 		Version:    AppVersion,
 		ReqLog:     reqlog,
-		// 逐请求用量聚合 + 模型输出上限探测文件（scripts/probe_max_tokens.py 写入，
-		// 面板只读展示）。
-		Usage:      rec,
+		// 模型输出上限探测文件（scripts/probe_max_tokens.py 写入，面板只读展示）。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		Live:       live,
 		ConfigPath: cfgPath,
@@ -312,7 +302,6 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		SoftCooldown: cfg.SoftRateDur,
 		Panel:        pn,
 		Live:         live,
-		Usage:        rec,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
@@ -330,7 +319,6 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		sessRouter: sessRouter,
 		live:       live,
 		reqlog:     reqlog,
-		usageRec:   rec,
 	}
 	// 日志镜像延迟到实例构建完成后接线：让装配期的日志也能进面板缓冲。
 	inst.StartLogMirror()
@@ -406,14 +394,10 @@ func (i *Instance) Close() {
 	if i.reqlog != nil {
 		i.reqlog.Close()
 	}
-	if i.usageRec != nil {
-		i.usageRec.Stop() // 停防抖落盘协程并立即刷一次余量（用量桶不丢尾巴）
-	}
 }
 
 // stateSibling 返回与 state 文件同目录的指定文件名路径（相对路径场景回落当前目录）。
-// usage.json（用量记录）与 output_probes.json（模型上限探测）共用本规则：config 里
-// 改 state_file 时数据文件跟着走，不需要额外配置项。
+// output_probes.json（模型上限探测）经此与 state_file 配置同目录搬移。
 func stateSibling(stateFile, name string) string {
 	dir := filepath.Dir(stateFile)
 	if dir == "" || dir == "." {
