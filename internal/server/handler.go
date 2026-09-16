@@ -607,6 +607,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				msg := upstream.ContentBlockedClientMessage(string(respBody))
 				writeOpenAIError(w, http.StatusBadRequest, "content_blocked", msg)
 				st.status = http.StatusBadRequest
+				st.errText = "content_blocked" // 终态：内容防火墙拦截，换号无意义（见上分支注释）
 				return
 			}
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
@@ -626,9 +627,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
 			_ = upstream.Stream(w, stats)
-			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
+			usage := stats.Usage()
+			recordAttempt(acct.UID, usage, attemptStarted)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			if usage.HasPromptTokens {
+				st.promptToks = int(usage.PromptTokens)
+			}
 			rc.Close()
 			return
 		}
@@ -639,20 +644,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
+			st.errText = err.Error() // 终态原因进表格日志的 err 段落（logChatRow 内净化截断）
 			return
 		}
-		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted)
+		usage := usageDeltaFromResponse(resp)
+		recordAttempt(acct.UID, usage, attemptStarted)
+		if usage.HasPromptTokens {
+			st.promptToks = int(usage.PromptTokens)
+		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
 		return
+	}
+	st.status = http.StatusServiceUnavailable
+	// 轮转耗尽终态：原因归类为 no_healthy_account，lastErr 非空时拼接简要
+	// （超长由 logChatRow 净化截断兜底）。
+	st.errText = "no_healthy_account"
+	if lastErr != nil {
+		st.errText += ": " + lastErr.Error()
 	}
 	msg := "all accounts unavailable (cooling/disabled)"
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
 	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
-	st.status = http.StatusServiceUnavailable
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。

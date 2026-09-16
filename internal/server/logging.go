@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -31,24 +32,26 @@ func SetChatLogOutput(w io.Writer) { chatLogOut = w }
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
-	start  time.Time
-	model  string
-	mode   string // "stream" | "sync"
-	uid    string // 完整 uid，展示时只取前 8 位
-	ttfb   time.Duration
-	toks   int // <0 表示 usage 缺失 → 显示 "-"
-	status int
+	start      time.Time
+	model      string
+	mode       string // "stream" | "sync"
+	uid        string // 完整 uid，展示时只取前 8 位
+	ttfb       time.Duration
+	toks       int // completion tokens；<0 表示 usage 缺失 → 显示 "-"
+	promptToks int // prompt tokens；-1 = usage 缺失 → 显示 "-"
+	status     int
+	errText    string // 失败原因短文本（终态才置值）；成功为空 → 行尾无 err 段落
 
 	logged bool
 }
 
-// newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
+// newChatStat 以请求进入 handler 的时刻为起点构造统计对象；token 两个维度默认 -1（usage 缺失）。
 func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	mode := "sync"
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1, promptToks: -1}
 }
 
 // done 幂等落一行表格日志。
@@ -57,7 +60,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.promptToks, s.toks, s.errText)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -252,22 +255,43 @@ func uidPrefix(uid string) string {
 	return uid
 }
 
+// errTextMaxRunes 失败原因文本的展示上限：err 段落是给人看的短原因，不是完整
+// 错误转储（完整错误走 writeOpenAIError 与系统日志）。
+const errTextMaxRunes = 60
+
+// sanitizeErrText 净化失败原因：'|' 与换行会截断/破坏表格行结构（面板按 '|'
+// 分列解析），替换为空格；超长截断到 60 rune。
+func sanitizeErrText(s string) string {
+	s = strings.NewReplacer("|", " ", "\r", " ", "\n", " ").Replace(s)
+	if runes := []rune(s); len(runes) > errTextMaxRunes {
+		return string(runes[:errTextMaxRunes])
+	}
+	return s
+}
+
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
-// toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+// inToks/outToks<0 表示 usage 缺失，显示 "-"；errText 非空（失败终态）时行尾
+// 追加 err 段落。格式与 panel/parseChatRow 的解析规则一一对应。
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, inToks, outToks int, errText string) {
 	if !chatLogEnabled {
 		return
 	}
 	seq := chatSeq.Add(1)
-	if len(model) > 11 {
-		model = model[:11]
+	// 截断上限 20：常见全名（含 cn:/global: 前缀，如 cn:glm-5.3-flash=16）完整保留，
+	// 面板结构化日志可直接回显全名；更长的（global:deepseek-v4.1-flash=26）留前 20。
+	if len(model) > 20 {
+		model = model[:20]
 	}
-	tokField := "-"
+	inField := "-"
+	if inToks >= 0 {
+		inField = strconv.Itoa(inToks)
+	}
+	outField := "-"
 	tokpsField := "-"
-	if toks >= 0 {
-		tokField = fmt.Sprintf("%d", toks)
+	if outToks >= 0 {
+		outField = strconv.Itoa(outToks)
 		if total > 0 {
-			tokpsField = fmt.Sprintf("%.1f", float64(toks)/total.Seconds())
+			tokpsField = fmt.Sprintf("%.1f", float64(outToks)/total.Seconds())
 		} else {
 			tokpsField = "0.0"
 		}
@@ -276,7 +300,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	line := fmt.Sprintf("| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | in=%s | out=%s | %stok/s | total=%.1fs |",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -284,8 +308,13 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		status,
 		uidPrefix(uid),
 		ttfbMS,
-		tokField,
+		inField,
+		outField,
 		tokpsField,
 		total.Seconds(),
 	)
+	if e := sanitizeErrText(errText); e != "" {
+		line += " err=" + e + " |"
+	}
+	fmt.Fprintln(chatLogOut, line)
 }

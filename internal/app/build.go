@@ -33,7 +33,7 @@ import (
 )
 
 // AppVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const AppVersion = "1.8.1-panel"
+const AppVersion = "1.9.0-panel"
 
 // Instance 一个已装配、尚未开始服务的网关实例。
 // 入口拿到它之后自行决定如何服务（ListenAndServe 等信号 / 开 WebView2 窗口），
@@ -50,6 +50,7 @@ type Instance struct {
 
 	sessRouter *session.Router
 	live       *livecfg.Holder
+	reqlog     *panel.ReqLog
 	schedCtx   context.Context
 	schedStop  context.CancelFunc
 }
@@ -248,6 +249,10 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		}
 		return nil
 	}
+	// 请求日志持久化：内存 24h 窗口 + logs/ 目录 JSONL 按天分段。相对工作目录——
+	// 桌面端 main 已把 CWD 锚到 exe 目录，服务端与数据目录同源。
+	reqlog := panel.NewReqLog("logs")
+
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Upstream:    up,
@@ -267,11 +272,15 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		// 粘性热开关的读写点：读走 live（含启动时 config 值），写 = live + 落盘。
 		StickyEnabled:   func() bool { return live.Load().StickyEnabled },
 		SetStickyEnabled: setStickyEnabled,
+		// 面板开发模式：WB2API_PANEL_DEV 指向源码 internal/panel 目录时，index.html/app.js
+		// 实时读盘 + 前端自动刷新，改 UI 免重新编译。生产部署不设置该变量。
+		DevDir: os.Getenv("WB2API_PANEL_DEV"),
 		// 宿主切号：把池内账号写入 WorkBuddy 官方客户端登录态（备份→关客户端→写→重启）。
 		// 备份落在数据目录内；认证文件路径默认用 hostswitch 官方位置，可用
 		// WB_HOST_AUTH_FILE 覆盖（测试注入临时文件 / 便携部署自定义位置）。
 		HostSwitch: hostswitch.NewService(os.Getenv("WB_HOST_AUTH_FILE"), filepath.Join(filepath.Dir(cfg.StateFile), "host-auth-backups")),
 		Version:    AppVersion,
+		ReqLog:     reqlog,
 		Live:       live,
 		ConfigPath: cfgPath,
 		LoadConfig: func() (any, error) { return Load(cfgPath) },
@@ -304,6 +313,7 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		Handler:    h,
 		sessRouter: sessRouter,
 		live:       live,
+		reqlog:     reqlog,
 	}
 	// 日志镜像延迟到实例构建完成后接线：让装配期的日志也能进面板缓冲。
 	inst.StartLogMirror()
@@ -333,7 +343,8 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 	return inst, nil
 }
 
-// StartLogMirror 把标准 log（stderr）与 chat 表格日志（stdout）镜像进面板缓冲。
+// StartLogMirror 把标准 log（stderr）与 chat 表格日志（stdout）镜像进面板缓冲，
+// 并把解析成功的对话行回调进 ReqLog（持久化 + 监控查询）。
 // 控制台输出行为完全不变——是 MultiWriter，不是重定向。
 func (i *Instance) StartLogMirror() {
 	if i.Panel == nil {
@@ -341,6 +352,9 @@ func (i *Instance) StartLogMirror() {
 	}
 	log.SetOutput(io.MultiWriter(os.Stderr, i.Panel.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, i.Panel.Logs()))
+	if i.reqlog != nil {
+		i.Panel.Logs().SetChatSink(i.reqlog.Write)
+	}
 }
 
 // Serve 在 cfg.Listen 上开始服务（阻塞）；返回非 ErrServerClosed 的错误。
@@ -362,7 +376,7 @@ func (i *Instance) Shutdown() {
 	_ = i.Server.Shutdown(ctx)
 }
 
-// Close 释放装配期资源（后台协程 + 池落盘）。幂等，入口 defer 调用即可。
+// Close 释放装配期资源（后台协程 + 池落盘 + 请求日志句柄）。幂等，入口 defer 调用即可。
 func (i *Instance) Close() {
 	if i.schedStop != nil {
 		i.schedStop()
@@ -372,6 +386,9 @@ func (i *Instance) Close() {
 		i.sessRouter.StopGC()
 	}
 	i.Pool.Close()
+	if i.reqlog != nil {
+		i.reqlog.Close()
+	}
 }
 
 // panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL

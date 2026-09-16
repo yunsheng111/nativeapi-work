@@ -152,10 +152,10 @@ func TestUIDPrefix(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234)
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1000, 1234, "")
 	})
 	for _, want := range []string{
-		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
+		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "in=1000", "out=1234", "tok/s |", "total=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
@@ -164,25 +164,47 @@ func TestLogChatRowFormat(t *testing.T) {
 	if strings.Contains(out, "00e26541abcdef") {
 		t.Errorf("full uid leaked: %s", out)
 	}
+	if strings.Contains(out, "err=") {
+		t.Errorf("success row must not carry err segment: %s", out)
+	}
 }
 
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, -1, "no_healthy_account: upstream 429 rate limit")
 	})
-	for _, want := range []string{"TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
+	for _, want := range []string{"TTFB=-", "in=-", "out=-", "-tok/s", "| 503 |", "err=no_healthy_account: upstream 429 rate limit |"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
 		}
 	}
 }
 
+func TestLogChatRowErrSanitized(t *testing.T) {
+	withChatLog(t)
+	// '|' 与换行破坏表格行结构（面板按 '|' 分列），必须替换为空格；超长截断到 60 rune。
+	errText := "a|b\nc\rd|" + strings.Repeat("x", 100)
+	out := captureStdout(t, func() {
+		logChatRow(0, time.Second, "m", "sync", "u", 503, -1, -1, errText)
+	})
+	if strings.Contains(out, "a|b") || strings.Contains(out, "b\nc") {
+		t.Errorf("err text not sanitized:\n%q", out)
+	}
+	// 净化后 "a b c d " (8 rune) + 截断保留 52 个 x → 恰好 60 rune。
+	if !strings.Contains(out, strings.Repeat("x", 52)) {
+		t.Errorf("err prefix lost:\n%s", out)
+	}
+	if strings.Contains(out, strings.Repeat("x", 53)) {
+		t.Errorf("err text not truncated to 60 runes:\n%s", out)
+	}
+}
+
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, "")
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, 1, "")
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -215,13 +237,13 @@ func TestChatLogsStreamRow(t *testing.T) {
 			t.Fatalf("code=%d", rec.Code)
 		}
 	})
-	for _, want := range []string{"| stream |", "| 200 |", "uid=u1", "TTFB=", "tok=1"} {
+	for _, want := range []string{"| stream |", "| 200 |", "uid=u1", "TTFB=", "in=1", "out=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stream row missing %q:\n%s", want, out)
 		}
 	}
-	if !strings.Contains(out, "tok=1") {
-		t.Errorf("tok: want precise usage completion_tokens: %s", out)
+	if !strings.Contains(out, "out=1") {
+		t.Errorf("out: want precise usage completion_tokens: %s", out)
 	}
 }
 
@@ -242,7 +264,7 @@ func TestChatLogsSyncRowTTFBDash(t *testing.T) {
 			t.Fatalf("code=%d", rec.Code)
 		}
 	})
-	for _, want := range []string{"| sync |", "| 200 |", "TTFB=-", "tok=1"} {
+	for _, want := range []string{"| sync |", "| 200 |", "TTFB=-", "in=1", "out=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("sync row missing %q:\n%s", want, out)
 		}
@@ -264,7 +286,7 @@ func TestChatLogsErrorRow(t *testing.T) {
 			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 		}
 	})
-	for _, want := range []string{"uid=u1", "| 503 |", "tok=-"} {
+	for _, want := range []string{"uid=u1", "| 503 |", "in=-", "out=-", "err=no_healthy_account"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("error row missing %q:\n%s", want, out)
 		}

@@ -2,7 +2,7 @@
 //
 // 与 cmd/server 共用 internal/app 的配置与装配；本文件只保留桌面端特有行为：
 //   - 工作目录锚定 exe 所在目录（config.json / auths / data 跟着 exe 走）；
-//   - GUI 无控制台，stdout/stderr 落到 data/desktop.log；
+//   - GUI 无控制台，stdout/stderr 落到 logs/app.log；
 //   - 无论 config 怎么写，强制 127.0.0.1 回环监听（不暴露局域网）；
 //   - WebView2 窗口加载 /panel/，关窗即优雅停机，不留后台进程。
 //
@@ -28,8 +28,8 @@ import (
 
 const (
 	windowTitle  = "WorkBuddy2API 控制台"
-	logPath      = "data/desktop.log"
-	logRotateMax = 8 << 20 // 超过 8MB 轮转一次，避免 GUI 日志无限增长
+	logPath      = "logs/app.log" // 与请求日志分段（logs/requests-*.jsonl）同目录归拢
+	logRotateMax = 8 << 20        // 超过 8MB 轮转一次，避免 GUI 日志无限增长
 	readyWait    = 15 * time.Second
 )
 

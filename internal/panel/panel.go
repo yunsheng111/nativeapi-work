@@ -12,9 +12,14 @@ package panel
 
 import (
 	"encoding/json"
+	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,6 +77,16 @@ type Config struct {
 	// 端点返回 501（非 Windows / 显式关闭）。指针直连而非闭包：hostswitch 是
 	// 自包含模块（路径注入 + 无池依赖），与 pool/session 无耦合。
 	HostSwitch *hostswitch.Service
+
+	// ReqLog 请求日志库（内存窗口 + 磁盘分段持久化，见 reqlog.go）。
+	// main 装配时注入（与 Ring 的 chatSink 对接）；nil 时 New 回退内存模式，
+	// 监控端点功能照常（测试与裸用场景无需额外装配）。
+	ReqLog *ReqLog
+
+	// DevDir 面板开发模式：index.html/app.js 改从该目录实时读取（改完自动刷新，
+	// 免重新编译），空 = 生产模式用 go:embed 内容。仅由环境变量 WB2API_PANEL_DEV 注入，
+	// 正常部署不设置。
+	DevDir string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -81,6 +96,7 @@ type Panel struct {
 	mux     *http.ServeMux
 	started time.Time
 	logs    *Ring
+	dev     devStatic // 开发模式热读盘（DevDir 为空时退化为 embed 静态）
 
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
@@ -97,6 +113,10 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// events 池变更广播器：pool 的 onChange 回调投递到这里，再由 /panel/api/events
+	// （SSE）扇出给浏览器，使面板从"定时轮询 overview"改为"变更即拉取"。
+	events *eventBroker
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -139,12 +159,26 @@ func New(cfg Config) *Panel {
 	if cfg.RedisMode == "" {
 		cfg.RedisMode = "noop"
 	}
+	// 请求日志 nil 回退内存模式：测试与裸用场景（不经 app.Build 装配）不落盘，
+	// 监控端点照常可用。
+	if cfg.ReqLog == nil {
+		cfg.ReqLog = NewReqLog("")
+	}
 	p := &Panel{
 		cfg:     cfg,
 		mux:     http.NewServeMux(),
 		started: time.Now(),
 		logs:    NewRing(500),
 		logins:  map[string]loginSession{},
+		events:  newEventBroker(),
+	}
+	if cfg.DevDir != "" {
+		p.dev.dir = cfg.DevDir
+	}
+	// 池变更 → 广播。注入必须在 p（含 p.events）构造完成之后：回调在请求热路径上被调用，
+	// 若早于构造完成注入，首个变更就会撞上 nil 的 events。
+	if cfg.Pool != nil {
+		cfg.Pool.SetOnChange(p.events.Notify)
 	}
 	p.routes()
 	return p
@@ -156,9 +190,15 @@ func (p *Panel) Logs() *Ring { return p.logs }
 func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
+	p.mux.HandleFunc("GET /panel/api/dev_version", p.withAuth(p.devVersionHandler))
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	p.mux.HandleFunc("GET /panel/api/events", p.withAuth(p.eventsHandler))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
+	p.mux.HandleFunc("GET /panel/api/chatlogs", p.withAuth(p.chatLogsHandler))
+	p.mux.HandleFunc("GET /panel/api/usage_stats", p.withAuth(p.usageStatsHandler))
+	p.mux.HandleFunc("GET /panel/api/metrics", p.withAuth(p.metricsHandler))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("GET /panel/api/models_all", p.withAuth(p.modelsAll))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -271,9 +311,166 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// ssePingInterval SSE 心跳间隔。取值远小于常见中间层 60s 空闲超时，留足容错余量。
+const ssePingInterval = 25 * time.Second
+
+// eventsHandler 池状态变更的 SSE 流（text/event-stream）。只在池状态真的变化时
+// 推一帧信号，前端收到后自行拉 overview —— 状态本体不走这条流，避免"推送内容"
+// 与"拉取内容"两套口径漂移。
+//
+// 之所以需要心跳：SSE 是长连接，中间层（反代/NAT/浏览器）会按"空闲"掐断静默连接，
+// 定期发注释帧维持活跃，客户端按 SSE 规范忽略注释帧（不触发 message 事件）。
+func (p *Panel) eventsHandler(w http.ResponseWriter, r *http.Request) {
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		// 无法逐帧 flush 时 SSE 会退化成"攒够缓冲才可见"，不如明确报错。
+		writeErr(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	// 禁用反代缓冲：nginx 默认会把响应攒起来，SSE 帧到不了浏览器。
+	h.Set("X-Accel-Buffering", "no")
+	// 清掉写超时：http.Server 配了 WriteTimeout/IdleTimeout 时，长连接会在超时点被
+	// 服务端单方面掐断。ResponseController 是 Go 1.20+ 的正规清法；部分 ResponseWriter
+	// 实现不支持（返回 ErrNotSupported），此时沿用原超时——连接仍可用，只是会按时断开
+	// 由客户端重连，故忽略错误而不中断本次订阅。
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+
+	// 先发一帧注释，让客户端立刻确认"连上了"（否则要等首个变更才知道握手成功）。
+	_, _ = io.WriteString(w, ": connected\n\n")
+	fl.Flush()
+
+	ch, cancel := p.events.Subscribe()
+	defer cancel()
+
+	ticker := time.NewTicker(ssePingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			// 客户端断开（关标签页/网络中断）：退出并取消订阅，释放 channel。
+			return
+		case <-ch:
+			_, _ = io.WriteString(w, "event: change\ndata: 1\n\n")
+			fl.Flush()
+		case <-ticker.C:
+			_, _ = io.WriteString(w, ": ping\n\n")
+			fl.Flush()
+		}
+	}
+}
+
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
+}
+
+// tryParseTime 解析监控查询参数的时间：依次尝试 RFC3339、无时区的本地时间
+// （秒/分钟两种粒度）、unix 毫秒数；空串或全部解析失败返回零值（= 不限）。
+// 无时区格式按本机时区解释：前端发的本地墙钟时间不应被隐式当作 UTC 平移。
+// 容错：query 里未编码的 "+" 会被解码成空格（RFC3339 的 "+08:00" 时区段是
+// 重灾区），而这些布局里空格本身不合法，解析前还原为 "+" 不会误伤。
+func tryParseTime(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}
+	}
+	s = strings.ReplaceAll(s, " ", "+")
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02T15:04"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t
+		}
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return time.UnixMilli(n)
+	}
+	return time.Time{}
+}
+
+// chatLogsHandler 监控视图的请求日志查询：服务端按时间/账号/模型/模式/状态筛选
+// 并分页（数据源是 ReqLog 的 24h 持久化窗口，单页量有界），随响应附带过滤结果
+// 的聚合指标（req/ok/err/token 合计/平均耗时），前端不再自行全量计算。
+func (p *Panel) chatLogsHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	opts := QueryOpts{
+		From:   tryParseTime(q.Get("from")),
+		To:     tryParseTime(q.Get("to")),
+		UID:    q.Get("uid"),
+		Model:  q.Get("model"),
+		Mode:   q.Get("mode"),
+		Status: q.Get("status"),
+		Limit:  atoiDefault(q.Get("limit"), 0),
+		Offset: atoiDefault(q.Get("offset"), 0),
+	}
+	if v, err := strconv.ParseBool(q.Get("err_only")); err == nil && v {
+		opts.ErrOnly = true
+	}
+	entries, total, stats := p.cfg.ReqLog.Query(opts)
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "total": total, "stats": stats})
+}
+
+// usageStatsHandler 监控视图的用量聚合：时间桶序列（前端画图，空桶补零）+
+// 按模型/账号的用量排行 + 总量指标。缺省窗口 = 最近 24h。
+func (p *Panel) usageStatsHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	from, to := tryParseTime(q.Get("from")), tryParseTime(q.Get("to"))
+	if from.IsZero() {
+		from = time.Now().Add(-24 * time.Hour)
+	}
+	if to.IsZero() {
+		to = time.Now()
+	}
+	writeJSON(w, http.StatusOK, p.cfg.ReqLog.UsageStats(from, to))
+}
+
+// metricsWindows 多窗口速率视角的窗口清单：60s 实时口径在低流量下常为 0，
+// 补三个长窗口（请求数 + 折算 TPM）让"运行状态"在个人部署流量下也有参考值。
+var metricsWindows = []time.Duration{10 * time.Minute, time.Hour, 24 * time.Hour}
+
+// metricsHandler 轻量指标快照（前端顶栏轮询）：速率（rpm/tpm 及其每秒折算）、
+// 在途、池健康度、粘性会话数与运行时长。单次调用只读内存窗口与池快照，开销可忽略。
+func (p *Panel) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	inFlight := 0
+	for _, s := range p.cfg.Pool.List() {
+		inFlight += s.InFlight
+	}
+	rpm, tpm := p.cfg.ReqLog.WindowCount(time.Minute)
+	accountsTotal, accountsHealthy, _, _, _ := p.cfg.Pool.CountsDetailed()
+	sticky := 0
+	if p.cfg.StickyCount != nil {
+		sticky = p.cfg.StickyCount()
+	}
+	windows := make([]map[string]any, 0, len(metricsWindows))
+	for _, win := range metricsWindows {
+		req, tokens := p.cfg.ReqLog.WindowCount(win)
+		windows = append(windows, map[string]any{
+			"sec": int(win.Seconds()),
+			"req": req,
+			// 窗口内 tokens 折算成"每分钟 Token"；窗口不足一分钟按实际秒数折算
+			"tpm": round1(float64(tokens) / (win.Minutes())),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"in_flight":        inFlight,
+		"rpm":              rpm,
+		"tpm":              tpm,
+		"qps":              round1(float64(rpm) / 60),
+		"tps":              round1(float64(tpm) / 60),
+		"windows":          windows,
+		"uptime_sec":       int(time.Since(p.started).Seconds()),
+		"accounts_total":   accountsTotal,
+		"accounts_healthy": accountsHealthy,
+		"sticky_sessions":  sticky,
+		"version":          p.cfg.Version,
+	})
+}
+
+// round1 保留 1 位小数（速率展示口径）。
+func round1(f float64) float64 {
+	return math.Round(f*10) / 10
 }
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
@@ -307,6 +504,69 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// modelsAll 聚合全部账号的模型名录（「监控」模型筛选下拉的数据源）。
+// 逐号实时拉取上游目录，按账号 realm 补 cn:/global: 前缀后并集去重——同一产品各号
+// 目录基本一致，但按域拆开才与客户端实际可请求的模型名对齐；单号失败不影响其余，
+// 全部失败才 502（前端有日志观测值兜底）。
+func (p *Panel) modelsAll(w http.ResponseWriter, r *http.Request) {
+	list := p.cfg.Pool.List()
+	if len(list) == 0 {
+		writeErr(w, http.StatusServiceUnavailable, "没有账号：请先在面板添加账号")
+		return
+	}
+	var (
+		mu   sync.Mutex
+		seen = make(map[string]bool)
+		okN  int
+		wg   sync.WaitGroup
+	)
+	sem := make(chan struct{}, 4) // 并发上限：别把上游目录接口打爆
+	for _, s := range list {
+		wg.Add(1)
+		go func(uid, realm string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			a := p.cfg.Pool.AuthByUID(uid)
+			if a == nil {
+				return
+			}
+			infos, err := p.cfg.Upstream.FetchModels(a)
+			if err != nil {
+				return
+			}
+			prefix := "cn:"
+			if realm == "global" {
+				prefix = "global:"
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			okN++
+			for _, mi := range infos {
+				id := mi.ID
+				if id == "" {
+					continue
+				}
+				if !strings.HasPrefix(id, "cn:") && !strings.HasPrefix(id, "global:") {
+					id = prefix + id
+				}
+				seen[id] = true
+			}
+		}(s.UID, s.Realm)
+	}
+	wg.Wait()
+	if okN == 0 {
+		writeErr(w, http.StatusBadGateway, "全部账号拉取模型目录失败")
+		return
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": ids, "accounts_queried": okN, "accounts_total": len(list)})
 }
 
 // ---------------------------------------------------------------------------

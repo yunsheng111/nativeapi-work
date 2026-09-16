@@ -2,13 +2,14 @@
 <html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>WorkBuddy2API · 控制台</title>
 <style>
 /* ── 设计令牌：明暗两套独立色板 ─────────────────────────────────────────
    冷石墨基调（仪表盘语言，非营销页）：底色分层 + 单一靛蓝强调（仅交互），
    语义色只给状态。等宽数字承载所有观测值，tabular-nums 对齐。 */
 :root {
+  color-scheme: dark;
   --bg: #0c0e14; --surface: #14171f; --surface-2: #1a1e28; --raise: #202531;
   --line: #262c3a; --line-soft: #1e232e;
   --ink: #e8ebf2; --ink-2: #a8b0c2; --ink-3: #6b7488;
@@ -21,6 +22,7 @@
   --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 [data-theme="light"] {
+  color-scheme: light;
   --bg: #f4f5f8; --surface: #ffffff; --surface-2: #f8f9fb; --raise: #ffffff;
   --line: #e2e5ec; --line-soft: #eceef3;
   --ink: #14171f; --ink-2: #545c6e; --ink-3: #8b93a5;
@@ -54,6 +56,7 @@ body {
 .nav a {
   display: flex; align-items: center; gap: 10px; padding: 8px 11px; margin-bottom: 2px;
   color: var(--ink-2); text-decoration: none; border-radius: 7px; font-size: 13.5px;
+  white-space: nowrap; /* 窄屏横排导航时不逐字折行，交给 nav 自身横向滚动 */
 }
 .nav a:hover { background: var(--surface-2); color: var(--ink); }
 .nav a.on { background: var(--accent-soft); color: var(--accent); font-weight: 550; }
@@ -144,7 +147,9 @@ body {
 .topbar .sep { color: var(--ink-3); }
 .topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
 .topbar .grow { flex: 1; }
-.view { padding: 22px 24px 60px; max-width: 1180px; width: 100%; }
+/* 不设 max-width：桌面全屏/大窗口下内容随主区铺满自适应（用户要求），
+   窄窗口由响应式断点接管。 */
+.view { padding: 22px 24px 60px; width: 100%; }
 .view[hidden] { display: none; }
 
 /* ── 控件 ─────────────────────────────────────────────────────────── */
@@ -168,6 +173,8 @@ input, select {
 }
 input:focus, select:focus { outline: none; border-color: var(--accent); }
 input[type=checkbox] { width: auto; accent-color: var(--accent); }
+/* 只读展示字段（如 API 地址）：弱化底色与文字，与可编辑输入框在视觉上区分 */
+input[readonly] { color: var(--ink-2); background: var(--surface); }
 label.fld { display: block; margin-bottom: 14px; }
 label.fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
 label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
@@ -185,11 +192,21 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
 .stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
 .stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
+/* 监控统计条只有 4 项：按 4 列铺满（覆盖基础 6 列网格，避免右侧空两格）。 */
+.stats.stats-4 { grid-template-columns: repeat(4, 1fr); }
+/* 统计卡副行：小号补充观测（成功/失败、输入/输出、口径说明），失败数可染色 */
+.stat .sub { font-size: 11px; color: var(--ink-3); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.stat .sub .bad { color: var(--bad); }
+/* 运行状态负载卡 5 项：宽屏 5 列，窄屏与 stats-4 同步降档 */
+.stats.stats-5 { grid-template-columns: repeat(5, 1fr); }
+@media (max-width: 980px) { .stats.stats-5 { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 760px) { .stats.stats-5 { grid-template-columns: repeat(2, 1fr); } }
 
 /* ── 面板块 ───────────────────────────────────────────────────────── */
 .box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
 .box > header { display: flex; align-items: center; gap: 12px; padding: 12px 17px; border-bottom: 1px solid var(--line-soft); }
 .box > header h3 { font-size: 13.5px; font-weight: 600; }
+.box > header h3 .hint { color: var(--ink-3); font-size: 11.5px; font-weight: 400; margin-left: 2px; }
 .box > header .grow { flex: 1; }
 .box > header .note { color: var(--ink-3); font-size: 12px; }
 .box .pad { padding: 17px; }
@@ -204,6 +221,11 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .acc td { padding: 11px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
 .acc tr:last-child td { border-bottom: none; }
 .acc tbody tr:hover { background: var(--surface-2); }
+/* 在用账号行（粘性会话绑定或在途请求>0）：整行绿色底，hover 加深不丢失。
+   放在 hover 规则之后，同优先级下后者胜出。 */
+.acc tbody tr.inuse { background: color-mix(in srgb, var(--ok) 15%, transparent); }
+.acc tbody tr.inuse:hover { background: color-mix(in srgb, var(--ok) 24%, transparent); }
+.acc tbody tr.inuse .mark i { box-shadow: 0 0 5px var(--ok); }
 /* 健康色条用真实单元格（td.mark）实现，而不是 tr::before 伪元素：
    伪元素在表格行内会被浏览器当作匿名单元格插入行首，整行内容右移一列、
    与表头错位——窗口越宽列越宽越明显。 */
@@ -231,7 +253,6 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
 .num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.usage-cell { min-width: 268px; }
 .usage-line {
   display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
   font: 600 11.5px/1.25 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap;
@@ -252,23 +273,164 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .usage-total em { color: var(--ink-2); }
 .usage-latency { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 18%, transparent); }
 .usage-rate { color: var(--ok); background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 18%, transparent); }
+
+/* ── 监控：四页签共用（工具行/页签/筛选行/明细表/分析/运行状态） ───── */
+.flt { padding: 13px 17px 0; border-bottom: 1px solid var(--line-soft); }
+.flt-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 11px; }
+.flt-row .lb { font-size: 12px; color: var(--ink-3); flex: none; }
+.flt-row .grow { flex: 1; }
+.flt-sel, .flt-in { width: auto; padding: 4.5px 9px; font-size: 12.5px; }
+.flt-sel { cursor: pointer; }
+#monModel { width: 180px; }
+/* 模型筛选目录（可搜索下拉）：fixed 定位挂 body，展开时按输入框矩形摆放 */
+.mwrap { display: inline-flex; align-items: center; gap: 4px; }
+.mdd-caret { padding: 4.5px 8px; font-size: 10px; color: var(--ink-3); flex: none; }
+.mdd {
+  position: fixed; z-index: 80; min-width: 240px; max-width: 360px;
+  max-height: 300px; overflow: auto; padding: 4px;
+  background: var(--raise); border: 1px solid var(--line); border-radius: 9px;
+  box-shadow: var(--shadow);
+}
+.mdd .mdd-item {
+  display: block; width: 100%; text-align: left; border: none; background: none;
+  padding: 6px 9px; border-radius: 6px; font: 12.5px var(--mono); color: var(--ink);
+  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mdd .mdd-item:hover { background: var(--accent-soft); color: var(--accent); }
+.mdd .mdd-note { padding: 7px 9px; font-size: 12px; color: var(--ink-3); }
+/* ── 监控视图专属：工具行/页签行/明细单元格/分析面板/运行状态资源 ──── */
+.mon-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.mon-toolbar .grow { flex: 1; }
+.mon-tabs { margin-bottom: 16px; }
+/* 错误页签行：浅红底铺满整行，hover 加深（特异性高于 .acc tr:hover 基础规则） */
+.acc.chat tbody tr.row-err { background: var(--bad-soft); }
+.acc.chat tbody tr.row-err:hover { background: color-mix(in srgb, var(--bad) 16%, transparent); }
+/* Token 单元格两行：↑输出 / ↓输入（箭头着色，数值走 formatTokenCount 缩写） */
+.tok2 { line-height: 1.55; }
+.tok2 i { font-style: normal; margin-right: 3px; font-weight: 600; }
+.tok2.out i { color: var(--ok); }
+.tok2.in i { color: var(--accent); }
+/* 响应性能三行小字：首字 / 速率 / 总耗时（缺失显示 —） */
+.perf { font-size: 11px; line-height: 1.6; color: var(--ink-2); }
+/* 用量分析面板：嵌套在 .box 里的统计条去掉投影与默认外边距 */
+.mon-inline-stats { margin-bottom: 16px; box-shadow: none; }
+.a-box { border: 1px solid var(--line-soft); border-radius: 9px; padding: 13px 15px; margin-bottom: 16px; }
+.a-title { font-size: 12.5px; font-weight: 600; color: var(--ink-2); margin-bottom: 10px; }
+.a-title .a-hint { color: var(--ink-3); font-weight: 400; font-size: 11px; margin-left: 4px; }
+#monChart { display: block; width: 100%; height: 220px; }
+.a-legend { display: flex; gap: 14px; margin-top: 8px; font-size: 11.5px; color: var(--ink-2); }
+.a-legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.a-legend .sw.in { background: var(--accent); }
+.a-legend .sw.out { background: var(--ok); }
+.a-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.a-grid .a-box { margin-bottom: 0; }
+@media (max-width: 900px) { .a-grid { grid-template-columns: 1fr; } }
+/* 分布行：名称 + 请求数/占比 + 占比横条 */
+.dist-row { margin-bottom: 10px; }
+.dist-row:last-child { margin-bottom: 0; }
+.dist-row .t { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; font-variant-numeric: tabular-nums; margin-bottom: 4px; }
+.dist-row .t .nm { flex: 1; min-width: 0; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dist-row .t .num { flex: none; color: var(--ink-2); }
+.dist-row .bar2 { height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
+.dist-row .bar2 i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+.dist-empty { font-size: 12px; color: var(--ink-3); }
+/* 运行状态资源区 */
+.res-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+@media (max-width: 900px) { .res-grid { grid-template-columns: repeat(2, 1fr); } }
+.res-cell .rk { font-size: 11px; color: var(--ink-3); margin-bottom: 3px; }
+.res-cell .rv { font: 550 13px var(--mono); font-variant-numeric: tabular-nums; word-break: break-all; }
+.flt-stats {
+  display: flex; gap: 16px; flex-wrap: wrap; padding: 10px 17px;
+  font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid var(--line-soft);
+}
+.flt-stats b { font-weight: 600; color: var(--ink); }
+.flt-stats .bad { color: var(--bad); }
+.chat-wrap { max-height: 480px; overflow: auto; }
+/* 固定布局 + colgroup：模式/状态列的 tag 是 inline-flex，其 max-content 贡献会让
+   自动表格布局把全部富余宽度灌进单列；fixed 布局按 colgroup 分配，富余宽度均匀
+   摊到未指定宽度的列（客户端模型/账号）。 */
+.acc.chat { table-layout: fixed; min-width: 880px; }
+.acc.chat th { position: sticky; top: 0; background: var(--surface); z-index: 1; box-shadow: 0 1px 0 var(--line); }
+.acc.chat td { padding: 7px 11px; font-family: var(--mono); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cred { min-width: 84px; }
 .cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
 .cred .n .of { color: var(--ink-3); font-size: 11px; }
 .bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 5px; overflow: hidden; max-width: 88px; }
 .bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+/* min-width:0 是防御性的：标签是 inline-flex，一旦被任何外部类带上 min-width
+   （例如历史遗留的 .tag.acc 撞上账号表的 .acc{min-width:640px}），标签会被撑到
+   那个最小宽并把所在窄列顶穿——宽度声明和 max-width:100% 都压不住 min-width。
+   标签的固有宽度应始终由内容决定。 */
 .tag {
   display: inline-flex; align-items: center; gap: 5px; padding: 1px 9px;
   border-radius: 999px; font-size: 11.5px; font-weight: 500; white-space: nowrap;
+  min-width: 0;
 }
 .tag.ok { background: var(--ok-soft); color: var(--ok); }
 .tag.warn { background: var(--warn-soft); color: var(--warn); }
 .tag.bad { background: var(--bad-soft); color: var(--bad); }
 .tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
-.tag.acc { background: var(--accent-soft); color: var(--accent); }
+/* 强调色标签。类名用 accent 而非 acc：acc 已被账号表（.acc{min-width:640px}）占用，
+   同元素带 acc 会让标签继承该 min-width 被撑成 640px。 */
+.tag.accent { background: var(--accent-soft); color: var(--accent); }
 #sessTarget { background: var(--surface-2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-size: 12.5px; }
 .acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
 .acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
+/* 操作列结构：td 只承担单元格（c-acts），按钮包在内层 div.acts 里做布局。
+   若把 flex/grid 直接挂在 td 上（覆盖 table-cell），表格布局非法——
+   匿名单元格宽度塌缩、换行按钮逐行竖排把行高撑爆。 */
+/* 账号池操作列：8 个按钮单行 nowrap 会把表格自然宽撑到 ~1500px，中窄窗口
+   （桌面 WebView 缩窗）必须横向滚动才能看到任何操作——固定排成 4×2 网格。
+   不用 flex-wrap 流式换行 + 右对齐：两行按钮总宽不同时逐列错位（用户反馈
+   「不整齐」）；网格让同一列跨行等宽对齐，视觉上是规整的矩阵。格子缺席会让
+   后续按钮顺移破格，所以 JS 侧保证每行恒 8 格：禁用号的「换号」渲染为禁用态
+   占位，宿主行用 tag 占位（拉伸到整列宽）。
+   轨道下限 74px：最宽按钮「设为宿主」4 字 + padding ≈ 68px，其余按钮 2 字
+   ≈ 46px——下限兜住后每列轨道跨行恒定等宽，宿主行的窄 tag 不会把该列缩窄。 */
+#view-accounts .c-acts { width: auto; }
+#view-accounts .acts {
+  display: grid; grid-template-columns: repeat(4, minmax(69px, auto));
+  gap: 5px; justify-content: end; white-space: nowrap;
+}
+#view-accounts .acts > button { width: 100%; }
+#view-accounts .acts > .tag { width: 100%; justify-content: center; }
+/* 「使用中」：粘性会话占用/在途请求账号的换号按钮位显示绿色标记，点击仍是换号 */
+#view-accounts .acts > button.use {
+  color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  background: var(--ok-soft); font-weight: 550;
+}
+#view-accounts .acts > button.use:hover:not(:disabled) { border-color: var(--ok); }
+/* 账号池表：fixed + colgroup。auto 布局会把富余列宽全灌进唯一可吞宽度的「会话」列
+   （其余窄列 nowrap 撑不动），实测曾把 613px 富余喂给它 → 整表 1569px 横向滚动。
+   内容列按表宽百分比（而非固定 px）分配：宽窗口下数据列随窗呼吸，不再出现
+   「左侧 74~150px 挤成一团 + 中段 800px 空档」；操作列不设宽度、吸收剩余，
+   按钮贴右。表格 min-width 兜住操作列 4×2 网格所需宽度——比它更窄的窗口交给
+   .tbl-wrap 横向滚动，而不是把列压到内容重叠（td 的 overflow:hidden 在 Chromium
+   对表格单元格无效，压过头就是文字压到邻列，必须靠宽度兜底）。 */
+#view-accounts .acc-fixed { min-width: 900px; }
+#view-accounts .c-mark { width: 3px; }
+#view-accounts .c-who { width: 14.5%; }
+#view-accounts .c-status { width: 12%; }
+#view-accounts .c-cred { width: 10%; }
+#view-accounts .c-succ { width: 8%; }
+#view-accounts .c-inflight { width: 4.5%; }
+#view-accounts .c-last { width: 9.5%; }
+#view-accounts .c-sess { width: 5.5%; }
+/* 宽窗口（≥1400）内容列再多分一档：占比 70.5%，操作列仍有 335px+ 放得下按钮网格 */
+@media (min-width: 1400px) {
+  #view-accounts .c-who { width: 17%; }
+  #view-accounts .c-status { width: 13%; }
+  #view-accounts .c-cred { width: 10.5%; }
+  #view-accounts .c-succ { width: 9%; }
+  #view-accounts .c-inflight { width: 5%; }
+  #view-accounts .c-last { width: 10%; }
+  #view-accounts .c-sess { width: 6%; }
+}
+/* 状态列内容（标签 + 备注）的裁剪容器：过长的冷却标签（如「积分冷却 · 10时00分」
+   实测 126px）在窄窗下截断而非压到「积分」列上；完整文案挂在容器 title 里。 */
+.acc .clip { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.acc-fixed { table-layout: fixed; }
 
 .empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
 .empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
@@ -337,6 +499,51 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .nav ul { display: flex; padding: 8px; } .nav .sig { border: none; }
   .stat { border-right: none; border-bottom: 1px solid var(--line-soft); }
 }
+
+/* ── 响应式：内容驱动断点（adapt）─────────────────────────────────────
+   桌面 WebView 窗口宽窄不定，平版/手机经局域网访问是次要语境。
+   两档内容断点：~1100px 表格/任务行开始挤（收紧间距），~760px 与侧栏
+   折叠同一档（统计条 2 列、筛选时间行独占、任务行两行制、弹层按钮换行）。
+   触屏语境（pointer:coarse）适度放大可点目标。数据表在窄屏保留 tbl-wrap
+   横向滚动（信息密度优先，不砍列）。 */
+@media (max-width: 1100px) {
+  .view { padding: 18px 16px 48px; }
+  .topbar { padding: 12px 16px; }
+  .acc th, .acc td { padding-left: 8px; padding-right: 8px; }
+  .acc.md th, .acc.md td { padding: 10px 7px; }
+  .who { min-width: 96px; max-width: 148px; }
+  .bar { max-width: 64px; }
+  /* 账号池：收窄后隐藏「在途」列（次要观测项，状态/成功失败足以判断健康），
+     操作网格降为 3 列（3+3+2），整表不再横向滚动。隐藏列时同步归零它的
+     colgroup 轨道——fixed 布局下 td 隐藏了轨道仍会占宽。 */
+  #view-accounts .in-flight-col { display: none; }
+  #view-accounts .c-inflight { width: 0; }
+  #view-accounts .acts { grid-template-columns: repeat(3, minmax(69px, auto)); }
+  .qrow { grid-template-columns: 96px 1fr 52px 84px minmax(110px, 190px); }
+  .srow, .shead { grid-template-columns: minmax(130px, 176px) 1fr auto; gap: 10px; }
+}
+@media (max-width: 760px) {
+  .view { padding: 14px 10px 40px; }
+  .topbar { flex-wrap: wrap; gap: 8px 10px; padding: 10px 12px; }
+  .topbar h2 { font-size: 14px; }
+  .stats.stats-4 { grid-template-columns: repeat(2, 1fr); }
+  #monModel { flex: 1 1 150px; }
+  .flt-stats { gap: 10px; }
+  .qrow { grid-template-columns: 80px 1fr 56px 80px; }
+  .qrow .msg { grid-column: 1 / -1; white-space: normal; }
+  .srow { grid-template-columns: 1fr auto; }
+  .srow .stasks, .shead .stasks { grid-column: 1 / -1; }
+  .stasks { grid-template-columns: repeat(auto-fit, minmax(64px, 1fr)); }
+  .dlg footer { flex-wrap: wrap; }
+  .savebar { flex-wrap: wrap; }
+  #toasts { left: 12px; right: 12px; bottom: 12px; align-items: stretch; }
+  .tst { max-width: none; }
+}
+@media (pointer: coarse) {
+  button, select, input { min-height: 38px; }
+  .acts button { padding: 8px 12px; }
+  .chips .chip { padding: 6px 12px; }
+}
 </style>
 </head>
 <body>
@@ -353,6 +560,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#sessions" data-view="sessions">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 3.2h11v7.2H8.2L5.5 13v-2.6H2.5z"/><path d="M5.5 6.6h5"/></svg>
         会话</a></li>
+      <li><a href="#monitoring" data-view="monitoring">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1.6 8.5h2.8l1.7-4.7 2.5 7.9 1.8-4.2.9 1h3.1"/></svg>
+        监控</a></li>
       <li><a href="#taskscenter" data-view="taskscenter">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
         任务中心</a></li>
@@ -395,7 +605,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
         <div class="stat"><div class="v" id="sLastChat" style="font-size:14px">-</div><div class="k" title="最近一次对话请求命中的账号（取各号最近使用时间的最大值）">最近请求</div></div>
-        <div class="stat"><div class="v" id="sHost" style="font-size:14px">-</div><div class="k" title="WorkBuddy 官方客户端当前登录的账号；可用账号行的「设为宿主」一键切换">宿主账号</div></div>
+        <div class="stat"><div class="v" id="sHostCn" style="font-size:14px">-</div><div class="k" title="国内版 WorkBuddy 客户端当前登录的账号；可用账号行的「设为宿主」一键切换">国内版宿主</div></div>
+        <div class="stat"><div class="v" id="sHostGlobal" style="font-size:14px">-</div><div class="k" title="国际版 WorkBuddyAI 客户端当前登录的账号；可用账号行的「设为宿主」一键切换">国际版宿主</div></div>
       </div>
 
       <div class="box">
@@ -410,14 +621,161 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnKeepaliveAll">全部保活</button>
         </header>
         <div class="tbl-wrap">
-        <table class="acc">
+        <table class="acc acc-fixed">
+          <colgroup>
+            <col class="c-mark"><col class="c-who"><col class="c-status"><col class="c-cred"><col class="c-succ"><col class="c-inflight"><col class="c-last"><col class="c-sess"><col class="c-acts">
+          </colgroup>
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
             <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th>会话</th><th class="c-acts"></th>
+            <th>成功 / 失败</th><th class="in-flight-col">在途</th><th>最近成功</th><th>会话</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 监控：请求明细 / 错误请求 / 用量分析 / 运行状态 四页签 -->
+    <section class="view" id="view-monitoring" hidden>
+      <div class="mon-toolbar">
+        <select id="monRange" class="flt-sel" title="时间范围（按请求完成时间）">
+          <option value="1h">近 1 小时</option>
+          <option value="6h">近 6 小时</option>
+          <option value="24h" selected>近 24 小时</option>
+          <option value="today">今天</option>
+        </select>
+        <button class="xs" id="monRefresh">刷新</button>
+        <button class="xs" id="monReset" title="清空筛选并恢复默认时间范围">重置</button>
+        <span class="grow"></span>
+        <button class="xs primary" id="monExport" title="按当前筛选导出请求明细（单次上限 10000 条）">导出 CSV</button>
+      </div>
+
+      <div class="stats stats-4">
+        <div class="stat"><div class="v" id="msReq">-</div><div class="k">总请求</div><div class="sub" id="msReqSub">成功 — · 失败 —</div></div>
+        <div class="stat"><div class="v" id="msTok">-</div><div class="k">总 Token</div><div class="sub" id="msTokSub">输入 — · 输出 —</div></div>
+        <div class="stat"><div class="v" id="msTtfb">-</div><div class="k">平均首字</div><div class="sub">首字节延迟</div></div>
+        <div class="stat"><div class="v" id="msTotal">-</div><div class="k">平均耗时</div><div class="sub">端到端</div></div>
+      </div>
+
+      <div class="mon-tabs">
+        <span class="chips" id="monTabs">
+          <button class="xs chip on" data-tab="detail">请求明细</button>
+          <button class="xs chip" data-tab="err">错误请求</button>
+          <button class="xs chip" data-tab="analysis">用量分析</button>
+          <button class="xs chip" data-tab="runtime">运行状态</button>
+        </span>
+      </div>
+
+      <!-- 明细/错误共用一张表；筛选行只在这两个页签出现 -->
+      <div class="box" id="monListPanel">
+        <header>
+          <h3 id="monListTitle">请求明细</h3>
+          <span class="grow"></span>
+          <span class="note">筛选变更即时生效</span>
+        </header>
+        <div class="flt">
+          <div class="flt-row">
+            <select id="monUid" class="flt-sel" title="按命中账号筛选">
+              <option value="">全部账号</option>
+            </select>
+            <span class="mwrap" id="monModelWrap">
+              <input id="monModel" class="flt-in" placeholder="客户端模型（包含匹配）" title="可填 cn:glm-5.3-flash 或裸名 glm-5.3-flash；输入即联想，点▾浏览全部账号的模型目录" spellcheck="false" autocomplete="off">
+              <button type="button" class="xs mdd-caret" id="monModelCaret" title="获取所有账号的模型目录">▾</button>
+            </span>
+            <select id="monMode" class="flt-sel" title="请求模式">
+              <option value="">全部模式</option>
+              <option value="stream">流式</option>
+              <option value="sync">非流式</option>
+            </select>
+          </div>
+        </div>
+        <div class="chat-wrap">
+          <table class="acc chat">
+            <colgroup>
+              <col style="width:80px"><col><col style="width:140px"><col style="width:72px"><col style="width:62px"><col style="width:92px"><col style="width:118px"><col style="width:190px">
+            </colgroup>
+            <thead><tr>
+              <th>时间</th><th>模型</th><th>账号</th><th>类型</th><th>状态</th><th>Token</th><th>响应性能</th><th>错误</th>
+            </tr></thead>
+            <tbody id="monBody"></tbody>
+          </table>
+        </div>
+        <div class="flt-stats" id="monNote">共 — 条 · 内存与磁盘保留 24 小时</div>
+      </div>
+
+      <!-- 用量分析：概览卡 + 趋势图 + 模型/账号分布 -->
+      <div class="box" id="monAnalysisPanel" hidden>
+        <header>
+          <h3>用量分析</h3>
+          <span class="grow"></span>
+          <span class="note">按所选时间范围聚合</span>
+        </header>
+        <div class="pad">
+          <div class="stats stats-4 mon-inline-stats">
+            <div class="stat"><div class="v" id="aReq">-</div><div class="k">范围请求</div></div>
+            <div class="stat"><div class="v" id="aTok">-</div><div class="k">范围 Token</div></div>
+            <div class="stat"><div class="v" id="aErr">-</div><div class="k">失败请求</div></div>
+            <div class="stat"><div class="v" id="aModels">-</div><div class="k">活跃模型</div></div>
+          </div>
+          <div class="a-box">
+            <div class="a-title">用量趋势 <span class="a-hint">输入 / 输出 tokens</span></div>
+            <canvas id="monChart"></canvas>
+            <div class="a-legend">
+              <span class="lg"><i class="sw in"></i>输入</span>
+              <span class="lg"><i class="sw out"></i>输出</span>
+            </div>
+          </div>
+          <div class="a-grid">
+            <div class="a-box">
+              <div class="a-title">模型分布 <span class="a-hint">按请求数 · 前 8</span></div>
+              <div id="monModels"></div>
+            </div>
+            <div class="a-box">
+              <div class="a-title">账号分布 <span class="a-hint">按请求数 · 前 8</span></div>
+              <div id="monAccounts"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 运行状态：负载指标 5s 轮询 + overview 资源快照 -->
+      <div class="box" id="monRuntimePanel" hidden>
+        <header>
+          <h3>运行状态</h3>
+          <span class="grow"></span>
+          <span class="note">负载指标每 5 秒刷新 · 资源信息随 overview 更新</span>
+        </header>
+        <div class="pad">
+          <div class="stats stats-5 mon-inline-stats">
+            <div class="stat"><div class="v" id="rtInflight">-</div><div class="k">当前并发</div><div class="sub">进行中的请求</div></div>
+            <div class="stat"><div class="v" id="rtRpm">-</div><div class="k">RPM</div><div class="sub">近 1 分钟请求</div></div>
+            <div class="stat"><div class="v" id="rtTpm">-</div><div class="k">TPM</div><div class="sub">近 1 分钟 Token</div></div>
+            <div class="stat"><div class="v" id="rtQps">-</div><div class="k">QPS</div><div class="sub">每秒请求</div></div>
+            <div class="stat"><div class="v" id="rtTps">-</div><div class="k">TPS</div><div class="sub">每秒 Token</div></div>
+          </div>
+          <div class="a-box">
+            <div class="a-title">速率视角 <span class="a-hint">低流量时看这里：长窗口折算</span></div>
+            <div class="res-grid" id="rtWindows"></div>
+          </div>
+          <div class="a-box">
+            <div class="a-title">账号用量 <span class="a-hint">累计口径（随池状态持久化）</span></div>
+            <div class="tbl-wrap">
+              <table class="acc">
+                <colgroup>
+                  <col style="width:200px"><col style="width:110px"><col style="width:130px"><col style="width:130px"><col style="width:140px"><col>
+                </colgroup>
+                <thead><tr>
+                  <th>账号</th><th>请求</th><th>Token</th><th>平均延迟</th><th>平均速率</th><th>最近使用</th>
+                </tr></thead>
+                <tbody id="rtUsageBody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="a-box">
+            <div class="a-title">资源</div>
+            <div class="res-grid" id="rtRes"></div>
+          </div>
         </div>
       </div>
     </section>
@@ -463,6 +821,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header>
           <h3>成长任务队列 <span class="hint" id="qcSummary"></span></h3>
           <span class="grow"></span>
+          <span class="chips" id="qcTabs" title="按执行结果分拣队列：失败/跳过也归入未完成">
+            <button class="xs chip on" data-q="open" id="qcTabOpen">未完成 0</button>
+            <button class="xs chip" data-q="done" id="qcTabDone">已完成 0</button>
+          </span>
           <label class="sel-note">并发
             <select id="qcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
           </label>
@@ -511,12 +873,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <header><h3>服务</h3><span class="grow"></span><span class="note" id="cfgPath"></span></header>
           <div class="pad">
             <div class="grid2">
-              <label class="fld"><span class="lb">监听地址</span>
-                <input name="listen" placeholder=":7863">
-                <span class="hint">改动需重启进程</span></label>
+              <label class="fld"><span class="lb">API 地址</span>
+                <div class="inline"><input id="cfgApiAddr" readonly spellcheck="false" placeholder="加载中…">
+                <button type="button" class="xs" id="btnCopyAddr">复制</button></div>
+                <span class="hint">OpenAI 兼容基址（base_url），客户端填此项</span></label>
               <label class="fld"><span class="lb">API 密钥</span>
                 <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权">
-                <button type="button" class="xs" id="btnEye">显示</button></div>
+                <button type="button" class="xs" id="btnEye">显示</button>
+                <button type="button" class="xs" id="btnCopyKey">复制</button></div>
                 <span class="hint">立即生效（含面板自身）</span></label>
             </div>
           </div>
@@ -655,12 +1019,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <section class="view" id="view-logs" hidden>
       <div class="box">
         <header>
-          <h3>运行日志</h3>
+          <h3>运行日志 <span class="hint">对话日志已移至「监控」</span></h3>
           <span class="grow"></span>
           <span class="chips" id="logChips">
             <button class="xs chip on" data-ch="all">全部</button>
             <button class="xs chip" data-ch="task">任务</button>
-            <button class="xs chip" data-ch="chat">对话</button>
             <button class="xs chip" data-ch="sys">系统</button>
           </span>
           <span class="note" id="logNote">最近 500 行</span>
@@ -750,6 +1113,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     </footer>
   </div>
 </div>
+
+<!-- 监控模型筛选目录：fixed 定位挂在 body 上，避免被 .box 的 overflow:hidden 裁剪 -->
+<div id="monModelDd" class="mdd" hidden></div>
 
 <div id="toasts"></div>
 
