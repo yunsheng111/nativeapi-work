@@ -572,22 +572,41 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .chips .chip { padding: 6px 12px; }
 }
   /* ── 积分构成 ───────────────────────────────────────────────── */
-  .pk-grid { display: flex; flex-wrap: wrap; gap: 10px; }
-  .pk-card { flex: 1 1 220px; min-width: 200px; border: 1px solid var(--line-soft);
-    border-radius: 8px; padding: 11px 13px; }
-  .pk-card .who { display: flex; align-items: baseline; gap: 7px; margin-bottom: 7px; }
+  /* 账号卡：大数字余额 + 近期到期 TOP 条 + 「查看全部积分包」入口（点击开弹窗）。
+     设计参照通用积分面板：余额一眼可见、最近要过期的包直接摆在卡上，全量明细进弹窗。 */
+  .pk-grid { display: flex; flex-wrap: wrap; gap: 12px; }
+  .pk-card { flex: 1 1 300px; min-width: 280px; border: 1px solid var(--line-soft);
+    border-radius: 10px; padding: 13px 15px; }
+  .pk-card .who { display: flex; align-items: baseline; gap: 7px; margin-bottom: 8px; }
   .pk-card .nm { font-weight: 600; font-size: 13px; }
   .pk-card .realm { font-size: 11px; color: var(--ink-3); font-family: var(--mono); }
-  .pk-card .big { font: 600 24px/1.1 var(--mono); font-variant-numeric: tabular-nums; }
-  .pk-card .sub { font-size: 11.5px; color: var(--ink-3); margin-top: 3px; }
-  .pk-card .mixbar { display: flex; height: 7px; border-radius: 4px; overflow: hidden;
-    margin-top: 8px; background: var(--surface-2); }
-  .pk-card .mixbar i { display: block; height: 100%; }
+  .pk-card .big { font: 600 26px/1.1 var(--mono); font-variant-numeric: tabular-nums; }
+  .pk-card .pk-sub { font-size: 11.5px; color: var(--ink-3); margin: 3px 0 11px; }
+  .pk-exp-hd { font-size: 11px; color: var(--ink-3); margin-bottom: 6px; }
+  .pk-exp { margin-bottom: 9px; }
+  .pk-exp .ln { display: flex; align-items: center; gap: 7px; font-size: 12px; margin-bottom: 4px; }
+  .pk-exp .val { font-weight: 600; font-family: var(--mono); white-space: nowrap; }
+  .pk-exp .pknm { color: var(--ink-2); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pk-exp .end { color: var(--ink-3); font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+  .pkbar { height: 5px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+  .pkbar i { display: block; height: 100%; background: var(--ok); }
   .pk-card .err { color: var(--warn); font-size: 12px; }
-  .pk-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 7px;
+  .pk-more { font-size: 12px; color: var(--accent); margin-top: 4px; cursor: pointer;
+    background: none; border: none; padding: 2px 0; }
+  .pk-more:hover { text-decoration: underline; }
+  /* 「全部积分包」弹窗列表 */
+  .pkg-item { border-bottom: 1px solid var(--line-soft); padding: 9px 2px; }
+  .pkg-item:last-child { border-bottom: none; }
+  .pkg-item .ln1 { display: flex; align-items: baseline; gap: 8px; }
+  .pkg-item .nm2 { font-size: 12.5px; font-weight: 550; flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pkg-item .num { font-family: var(--mono); font-variant-numeric: tabular-nums;
+    font-weight: 600; white-space: nowrap; }
+  .pkg-item .of { color: var(--ink-3); font-weight: 400; }
+  .pkg-item .used { color: var(--ink-3); font-size: 11px; white-space: nowrap; }
+  .pkg-item .ln2 { display: flex; align-items: center; gap: 8px; margin-top: 5px;
     font-size: 11px; color: var(--ink-3); }
-  .pk-legend span { display: flex; align-items: center; gap: 5px; }
-  .pk-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .pkg-item .ln2 .pkbar { flex: 1; }
 
 </style>
 </head>
@@ -926,7 +945,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </header>
         <div class="pad"><div class="pk-grid" id="pkSummary"></div></div>
       </div>
-      <div id="pkDetail"></div>
     </section>
 
     <!-- 配置 -->
@@ -1113,8 +1131,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 积分任务 -->
-<div class="veil" id="taskVeil">
-  <div class="dlg" style="width:940px">
+<!-- 「全部积分包」弹窗：单账号逐包明细（参考通用积分面板的全量列表） -->
+<div class="veil" id="pkgVeil">
+  <div class="dlg" style="width:560px">
+    <header>
+      <h3 id="pkgDlgTitle">全部积分包</h3>
+      <div class="hint" id="pkgDlgSub"></div>
+    </header>
+    <div class="body"><div class="pad" id="pkgDlgList" style="max-height:62vh;overflow:auto"></div></div>
+    <footer style="display:flex;justify-content:flex-end"><button class="xs" id="btnPkgClose">关闭</button></footer>
+  </div>
+</div>
+
+<div class="veil" id="taskVeil">  <div class="dlg" style="width:940px">
     <header>
       <h3>积分任务 <span class="hint" id="taskWho"></span></h3>
       <div class="hint">查询上游任务进度；「接受」为报名（幂等），「领取」在进度达标后可用。所有操作走网关，无需外部脚本。</div>
