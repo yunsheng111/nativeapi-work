@@ -10,6 +10,7 @@ import (
 )
 
 func (p *Pool) Disable(uid, reason string) {
+	defer p.notify() // 先注册 → 后执行（LIFO），保证解锁后才通知
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
@@ -26,6 +27,7 @@ func (p *Pool) Disable(uid, reason string) {
 // 这些号是无人可换时的正常结果，静默接受比报错更符合运维直觉。
 // 但 target 为已禁用时避让无意义（它本就不可选），仍写入以便审计时间线。
 func (p *Pool) Eject(uid string, d time.Duration, reason string) bool {
+	defer p.notify() // 先注册 → 后执行（LIFO），保证解锁后才通知
 	if d <= 0 {
 		d = defaultEjectDuration
 	}
@@ -44,6 +46,7 @@ func (p *Pool) Eject(uid string, d time.Duration, reason string) bool {
 // （ReviveDisabled / ReenableIfCredits / NoteSuccess 均不触碰 locked）。
 // reason 为空时用 lockReasonManual 兜底。uid 不存在返回 false。
 func (p *Pool) Lock(uid, reason string) bool {
+	defer p.notify() // 先注册 → 后执行（LIFO），保证解锁后才通知
 	if reason == "" {
 		reason = lockReasonManual
 	}
@@ -60,6 +63,7 @@ func (p *Pool) Lock(uid, reason string) bool {
 // Unlock 解除人工锁定，账号回到池子（若无其他冷却/熔断则立即可选）。
 // uid 不存在或本来就未锁定返回 false（供面板区分"已解锁"与"不存在/未锁"）。
 func (p *Pool) Unlock(uid string) bool {
+	defer p.notify() // 先注册 → 后执行（LIFO），保证解锁后才通知
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -128,6 +132,7 @@ func (p *Pool) ClearSessionDead(uid string) {
 // 不应顺带解除运维的锁定（否则"锁住别再被用"会被自动路径推翻）。reason 的清理
 // 同样避开锁定期——locked 时 reason 承载锁定文案，清掉会让面板失去"为什么不可用"的线索。
 func (p *Pool) ReviveDisabled(uid string) {
+	defer p.notify() // 先注册 → 后执行（LIFO），保证解锁后才通知
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok && e.disabled {
@@ -148,6 +153,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 // 反之 ReviveDisabled 是自动复活路径，必须保留人工锁定意图（见 transition.go 正交性说明）。
 // uid 不存在返回 false（供调用方区分"账号不存在"与"已复活"）。
 func (p *Pool) Revive(uid string) bool {
+	defer p.notify() // 先注册 → 后执行（LIFO），保证解锁后才通知
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -192,6 +198,7 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 // NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal。
 // 达到 breakerThreshold 触发熔断（指数退避），连续失败语义整体并入熔断器（不再有独立的 err 冷却）。
 func (p *Pool) NoteError(uid string) {
+	defer p.notify() // 先注册 → 后执行（LIFO），保证解锁后才通知
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
@@ -210,6 +217,7 @@ func (p *Pool) NoteError(uid string) {
 // 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
 // 冷却（Cooldown/reviveCoolingLocked）清除。
 func (p *Pool) NoteSuccess(uid string) {
+	defer p.notify() // 先注册 → 后执行（LIFO），保证解锁后才通知
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
@@ -227,6 +235,7 @@ func (p *Pool) NoteSuccess(uid string) {
 // RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
 // usage 字段缺失时仍累计请求次数，但只累计明确存在的 token 字段。
 func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
+	defer p.notify() // 先注册 → 后执行（LIFO），保证解锁后才通知
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -257,6 +266,13 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	}
 	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
 		usage.LastLatencyMs = delta.LatencyMs
+		usage.SumLatencyMs += delta.LatencyMs
+		usage.LatencyCount++
+		if delta.HasCompletionTokens && delta.CompletionTokens > 0 {
+			// 有产出的逐对累计（耗时与 tokens 同请求成对），平均速率分子分母同口径。
+			usage.ActiveLatencyMs += delta.LatencyMs
+			usage.ActiveCompletionTokens += delta.CompletionTokens
+		}
 	}
 	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
 		speed := delta.TokensPerSecond

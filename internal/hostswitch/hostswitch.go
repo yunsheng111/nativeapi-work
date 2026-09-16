@@ -1,6 +1,15 @@
 // Package hostswitch 把 wb2api 账号池的凭证写入 WorkBuddy 官方桌面客户端的登录态
-// 文件（workbuddy-desktop.info），实现"宿主侧切号"：面板选一个池内账号 → 备份 →
-// （可选）关闭 WorkBuddy → 写入 → （可选）重启 WorkBuddy，官方客户端即以该账号登录。
+// 文件，实现"宿主侧切号"：面板选一个池内账号 → 备份 → （可选）关闭客户端 → 写入 →
+// （可选）重启客户端，官方客户端即以该账号登录。
+//
+// 官方客户端分国内版与国际版两个独立安装，登录态文件与进程名各不相同：
+//
+//	版本     认证文件                        进程             domain
+//	cn       workbuddy-desktop.info          WorkBuddy.exe    www.codebuddy.cn
+//	global   workbuddy-desktop-ai.info       WorkBuddyAI.exe  www.workbuddy.ai
+//
+// 两文件同在 CodeBuddyExtension 的 auth 目录下（国际版不带独立扩展目录，仅文件名
+// 多 -ai 后缀——与 domain www.workbuddy.ai 对应），故按 realm 选文件即可，目录共享。
 //
 // 认证文件规格（对照 changexbc/workbuddy-switch 的 auth_file.rs，行为对齐）：
 //   - Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info
@@ -34,6 +43,9 @@ import (
 )
 
 // Account 切号目标的归一化凭证（wb2api auth.Auth 的同构投影；ExpiresAtSec 为 Unix 秒）。
+// Realm 决定写入哪个客户端（"cn" / "global"，空按 cn 处理）——cn 凭证写进国际版
+// 客户端会因 domain 不匹配而无法登录，反之亦然，所以 realm 必须由调用方从账号
+// 本体带过来，本包不做 domain 推断。
 type Account struct {
 	UID          string
 	Nickname     string
@@ -41,7 +53,8 @@ type Account struct {
 	RefreshToken string
 	TokenType    string // 空 = "Bearer"
 	Domain       string
-	ExpiresAtSec int64 // Unix 秒；<=0 表示未知（写入 expiresIn=0）
+	Realm        string // "cn" / "global"，空 = cn
+	ExpiresAtSec int64  // Unix 秒；<=0 表示未知（写入 expiresIn=0）
 }
 
 // Current 宿主登录态的只读快照（不含 token，供面板展示）。
@@ -63,23 +76,30 @@ type Result struct {
 	Nickname  string `json:"nickname"`
 }
 
-// Service 宿主切号服务。authPath/backupDir 由装配层注入：生产传官方路径与
-// data/host-auth-backups/，测试传临时路径（绝不触碰真实宿主文件）。
+// Service 宿主切号服务。authPath（cn）/authPathGlobal（global）与 backupDir 由装配层
+// 注入：生产传官方路径与 data/host-auth-backups/，测试传临时路径（绝不触碰真实宿主文件）。
 type Service struct {
-	authPath  string
-	backupDir string
-	mu        sync.Mutex // 串行化切换（并发切换 = 备份/写入交错，无意义且危险）
+	authPath       string     // 国内版认证文件（兼容字段语义：WB_HOST_AUTH_FILE 显式指定的目标）
+	authPathGlobal string     // 国际版认证文件；空 = 与 cn 同文件（显式注入单文件的旧用法）
+	backupDir      string
+	mu             sync.Mutex // 串行化切换（并发切换 = 备份/写入交错，无意义且危险）
 }
 
-// NewService 构造；authPath 为空时用当前平台的官方默认路径。
+// NewService 构造。authPath 为空时用当前平台的官方默认路径（cn）；
+// 国际版路径取同目录的 workbuddy-desktop-ai.info——显式注入（测试/便携部署）时
+// 两个版本仍成对落在同一 auth 目录，与官方客户端的实际布局一致。
 func NewService(authPath, backupDir string) *Service {
 	if authPath == "" {
 		authPath = DefaultAuthFilePath()
 	}
-	return &Service{authPath: authPath, backupDir: backupDir}
+	return &Service{
+		authPath:       authPath,
+		authPathGlobal: GlobalAuthFilePath(filepath.Dir(authPath)),
+		backupDir:      backupDir,
+	}
 }
 
-// DefaultAuthFilePath 当前平台 WorkBuddy 认证文件路径。
+// DefaultAuthFilePath 当前平台 WorkBuddy 国内版认证文件路径。
 func DefaultAuthFilePath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -99,24 +119,50 @@ func DefaultAuthFilePath() string {
 	}
 }
 
-// AuthFilePath 返回本服务实际使用的认证文件路径（诊断用）。
+// GlobalAuthFilePath 在 dir 下拼国际版认证文件名（workbuddy-desktop-ai.info）。
+// 独立成函数而非写死在构造里：显式注入路径时同目录派生、官方默认路径时天然命中
+// 真实国际版文件，两处调用共用同一命名约定。
+func GlobalAuthFilePath(dir string) string {
+	return filepath.Join(dir, "workbuddy-desktop-ai.info")
+}
+
+// authPathFor 返回 realm 对应的认证文件路径。global 未注入独立路径时回落 cn 文件
+// （只可能出现在"调用方没填 Realm"的旧数据流，回落保证单文件用法行为不回退）。
+func (s *Service) authPathFor(realm string) string {
+	if realm == "global" && s.authPathGlobal != "" {
+		return s.authPathGlobal
+	}
+	return s.authPath
+}
+
+// AuthFilePath 返回本服务实际使用的国内版认证文件路径（诊断用）。
 func (s *Service) AuthFilePath() string { return s.authPath }
+
+// AuthFilePathFor 返回 realm 对应的认证文件路径（诊断用）。
+func (s *Service) AuthFilePathFor(realm string) string { return s.authPathFor(realm) }
 
 // ---------------------------------------------------------------------------
 // 读取
 // ---------------------------------------------------------------------------
 
-// Current 读当前登录态（文件不存在返回 FileExists=false 的零值，不报错）。
-func (s *Service) Current() (*Current, error) {
-	root, err := s.readAuth()
+// Current 读国内版宿主登录态（保留旧签名：面板旧字段与既有测试的 cn 快捷方式）。
+func (s *Service) Current() (*Current, error) { return s.CurrentForRealm("cn") }
+
+// CurrentForRealm 读 realm 对应客户端的当前登录态
+// （文件不存在返回 FileExists=false 的零值，不报错）。
+func (s *Service) CurrentForRealm(realm string) (*Current, error) {
+	raw, err := os.ReadFile(s.authPathFor(realm))
 	if err != nil {
-		return nil, err
+		if errors.Is(err, os.ErrNotExist) {
+			return &Current{}, nil
+		}
+		return nil, fmt.Errorf("read auth file: %w", err)
 	}
-	c := &Current{}
-	if root == nil {
-		return c, nil
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil, fmt.Errorf("parse auth file %s: %w", s.authPathFor(realm), err)
 	}
-	c.FileExists = true
+	c := &Current{FileExists: true}
 	c.UID = strOf(root["uid"], objOf(root["account"])["uid"])
 	c.Nickname = firstStr(root["nickname"], objOf(root["account"])["nickname"])
 	auth := objOf(root["auth"])
@@ -125,10 +171,10 @@ func (s *Service) Current() (*Current, error) {
 	return c, nil
 }
 
-// readAuth 读并解析认证文件；不存在返回 (nil, nil)，解析失败报错（写坏比读不出更糟，
-// 这里宁可不切）。
-func (s *Service) readAuth() (map[string]any, error) {
-	raw, err := os.ReadFile(s.authPath)
+// readAuthAt 读并解析指定认证文件；不存在返回 (nil, nil)，解析失败报错（写坏比读
+// 不出更糟，这里宁可不切）。
+func readAuthAt(path string) (map[string]any, error) {
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -137,7 +183,7 @@ func (s *Service) readAuth() (map[string]any, error) {
 	}
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, fmt.Errorf("parse auth file %s: %w", s.authPath, err)
+		return nil, fmt.Errorf("parse auth file %s: %w", path, err)
 	}
 	return m, nil
 }
@@ -146,8 +192,10 @@ func (s *Service) readAuth() (map[string]any, error) {
 // 切换
 // ---------------------------------------------------------------------------
 
-// Switch 把 acc 写入宿主登录态。restart=true 时按标准时序执行（关 WorkBuddy → 写 → 启动）；
-// progress 非空则逐步回调进度文案。同进程内串行（互斥）。
+// Switch 把 acc 写入 acc.Realm 对应客户端的登录态。restart=true 时按标准时序执行
+// （关客户端 → 写 → 启动）；progress 非空则逐步回调进度文案。同进程内串行（互斥）。
+// 客户端与认证文件按 realm 成对选择（cn → WorkBuddy.exe / workbuddy-desktop.info，
+// global → WorkBuddyAI.exe / workbuddy-desktop-ai.info），跨版本写文件不会生效。
 func (s *Service) Switch(acc Account, restart bool, progress func(string)) (*Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -161,40 +209,41 @@ func (s *Service) Switch(acc Account, restart bool, progress func(string)) (*Res
 		return nil, errors.New("uid 与 accessToken 均不能为空")
 	}
 
+	authPath := s.authPathFor(acc.Realm)
 	res := &Result{UID: acc.UID, Nickname: acc.Nickname}
 
 	// 1) 备份（文件存在才备份；备份失败即中止——没有退路的写操作不做）。
 	say("备份宿主认证文件…")
-	backup, err := s.backup()
+	backup, err := s.backup(authPath)
 	if err != nil {
 		return nil, err
 	}
 	res.Backup = backup
 
-	// 2) restart 时先关闭 WorkBuddy（顺序约束见包注释：退出会覆盖登录态文件）。
+	// 2) restart 时先关闭目标客户端（顺序约束见包注释：退出会覆盖登录态文件）。
 	if restart {
-		say("关闭 WorkBuddy…")
-		closed, err := closeWorkBuddy(20 * time.Second)
+		say("关闭 " + procDisplayName(acc.Realm) + "…")
+		closed, err := closeClient(clientProcName(acc.Realm), 20*time.Second)
 		if err != nil {
-			return nil, fmt.Errorf("close WorkBuddy: %w", err)
+			return nil, fmt.Errorf("close %s: %w", procDisplayName(acc.Realm), err)
 		}
 		res.ClosedWB = closed
 	}
 
 	// 3) 写入 + 写后校验。
 	say("写入认证文件…")
-	allCount, err := s.writeAccount(acc)
+	allCount, err := s.writeAccount(authPath, acc)
 	if err != nil {
 		return nil, err
 	}
 	res.AllCount = allCount
 
-	// 4) restart 时拉起 WorkBuddy。
+	// 4) restart 时拉起目标客户端。
 	if restart {
-		say("启动 WorkBuddy…")
-		launched, err := launchWorkBuddy()
+		say("启动 " + procDisplayName(acc.Realm) + "…")
+		launched, err := launchClient(acc.Realm)
 		if err != nil {
-			return nil, fmt.Errorf("launch WorkBuddy: %w", err)
+			return nil, fmt.Errorf("launch %s: %w", procDisplayName(acc.Realm), err)
 		}
 		res.Launched = launched
 	}
@@ -203,10 +252,12 @@ func (s *Service) Switch(acc Account, restart bool, progress func(string)) (*Res
 	return res, nil
 }
 
-// backup 复制当前认证文件到备份目录（workbuddy-desktop.<RFC3339 时间戳>.info）。
-// 文件不存在返回 ("", nil)——首次运行宿主从未登录属正常状态。
-func (s *Service) backup() (string, error) {
-	raw, err := os.ReadFile(s.authPath)
+// backup 复制当前认证文件到备份目录（<basename 去后缀>.<RFC3339 时间戳>.info，如
+// workbuddy-desktop.20260916-120000.info / workbuddy-desktop-ai.….info——从源文件名
+// 派生，国内版/国际版备份天然可分）。文件不存在返回 ("", nil)——首次运行宿主从未
+// 登录属正常状态。
+func (s *Service) backup(authPath string) (string, error) {
+	raw, err := os.ReadFile(authPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", nil
@@ -216,7 +267,8 @@ func (s *Service) backup() (string, error) {
 	if err := os.MkdirAll(s.backupDir, 0o755); err != nil {
 		return "", fmt.Errorf("create backup dir: %w", err)
 	}
-	name := fmt.Sprintf("workbuddy-desktop.%s.info", time.Now().Format("20060102-150405"))
+	base := strings.TrimSuffix(filepath.Base(authPath), ".info")
+	name := fmt.Sprintf("%s.%s.info", base, time.Now().Format("20060102-150405"))
 	dst := filepath.Join(s.backupDir, name)
 	if err := os.WriteFile(dst, raw, 0o600); err != nil {
 		return "", fmt.Errorf("write backup: %w", err)
@@ -224,9 +276,10 @@ func (s *Service) backup() (string, error) {
 	return dst, nil
 }
 
-// writeAccount 构造四段 JSON 并原子写入，随后重读校验 accessToken。返回并入后的 allAccounts 长度。
-func (s *Service) writeAccount(acc Account) (int, error) {
-	existing, err := s.readAuth()
+// writeAccount 构造四段 JSON 并原子写入 authPath，随后重读校验 accessToken。
+// 返回并入后的 allAccounts 长度。
+func (s *Service) writeAccount(authPath string, acc Account) (int, error) {
+	existing, err := readAuthAt(authPath)
 	if err != nil {
 		return 0, err
 	}
@@ -255,12 +308,12 @@ func (s *Service) writeAccount(acc Account) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("marshal auth file: %w", err)
 	}
-	if err := atomicWrite(s.authPath, content); err != nil {
+	if err := atomicWrite(authPath, content); err != nil {
 		return 0, fmt.Errorf("write auth file: %w", err)
 	}
 
 	// 写后校验：重读比对 accessToken，防止半写/被外部覆盖。
-	check, err := s.readAuth()
+	check, err := readAuthAt(authPath)
 	if err != nil {
 		return 0, fmt.Errorf("verify auth file: %w", err)
 	}
@@ -348,18 +401,33 @@ func atomicWrite(path string, content []byte) error {
 // WorkBuddy 进程管理（Windows 原生实现；非 Windows 平台 restart 降级为不可用）
 // ---------------------------------------------------------------------------
 
-const workbuddyProcName = "WorkBuddy.exe"
+// clientProcName 返回 realm 对应客户端的进程名：cn → WorkBuddy.exe，global →
+// WorkBuddyAI.exe（国际版独立安装与进程，与国内版可并存运行）。
+func clientProcName(realm string) string {
+	if realm == "global" {
+		return "WorkBuddyAI.exe"
+	}
+	return "WorkBuddy.exe"
+}
 
-// workBuddyExePath 探测 WorkBuddy 可执行文件：优先当前运行中的进程镜像路径
-// （最可靠——安装位置任意，如本机 D:\WorkBuddy），否则常见安装位。
-// 必须在关闭进程**之前**调用并记住结果。
-func workBuddyExePath() (string, bool) {
-	if pids := findWorkBuddyPIDs(); len(pids) > 0 {
+// procDisplayName 面向运维文案的客户端显示名（进度提示/错误信息用）。
+func procDisplayName(realm string) string {
+	if realm == "global" {
+		return "WorkBuddy 国际版"
+	}
+	return "WorkBuddy"
+}
+
+// workBuddyExePath 探测客户端可执行文件：优先当前运行中的进程镜像路径
+// （最可靠——安装位置任意，如本机国内版 D:\WorkBuddy、国际版 D:\WorkBuddyAI），
+// 否则常见安装位。必须在关闭进程**之前**调用并记住结果。
+func workBuddyExePath(procName string) (string, bool) {
+	if pids := findClientPIDs(procName); len(pids) > 0 {
 		if exe := processImageName(pids[0]); exe != "" {
 			return exe, true
 		}
 	}
-	for _, p := range candidateExePaths() {
+	for _, p := range candidateExePaths(procName) {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p, true
 		}
@@ -367,49 +435,62 @@ func workBuddyExePath() (string, bool) {
 	return "", false
 }
 
-func candidateExePaths() []string {
+// candidateExePaths 返回 procName 的候选安装路径。仅接受本包定义的两个进程名常量，
+// 路径表为写死的字面量（不做名字派生），其他输入返回空。
+func candidateExePaths(procName string) []string {
 	local := os.Getenv("LOCALAPPDATA")
-	var out []string
-	if local != "" {
-		out = append(out, filepath.Join(local, "Programs", "WorkBuddy", workbuddyProcName))
+	switch procName {
+	case "WorkBuddy.exe":
+		var out []string
+		if local != "" {
+			out = append(out, filepath.Join(local, "Programs", "WorkBuddy", "WorkBuddy.exe"))
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			out = append(out, filepath.Join(home, "Desktop", "WorkBuddy", "WorkBuddy.exe"))
+		}
+		return append(out, `D:\WorkBuddy\WorkBuddy.exe`, `C:\WorkBuddy\WorkBuddy.exe`)
+	case "WorkBuddyAI.exe":
+		var out []string
+		if local != "" {
+			out = append(out, filepath.Join(local, "Programs", "WorkBuddyAI", "WorkBuddyAI.exe"))
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			out = append(out, filepath.Join(home, "Desktop", "WorkBuddyAI", "WorkBuddyAI.exe"))
+		}
+		return append(out, `D:\WorkBuddyAI\WorkBuddyAI.exe`, `C:\WorkBuddyAI\WorkBuddyAI.exe`)
+	default:
+		return nil
 	}
-	if home, err := os.UserHomeDir(); err == nil {
-		out = append(out,
-			filepath.Join(home, "Desktop", "WorkBuddy", workbuddyProcName),
-			filepath.Join("D:\\", "WorkBuddy", workbuddyProcName),
-			filepath.Join("C:\\", "WorkBuddy", workbuddyProcName),
-		)
-	}
-	return out
 }
 
-// closeWorkBuddy 终止全部 WorkBuddy 进程并等待退出（超时报错）。
+// closeClient 终止 realm 对应客户端的全部进程并等待退出（超时报错）。
 // 返回 false = 本来就没在运行（不算错误）。
-func closeWorkBuddy(wait time.Duration) (bool, error) {
-	pids := findWorkBuddyPIDs()
+func closeClient(realm string, wait time.Duration) (bool, error) {
+	procName := clientProcName(realm)
+	pids := findClientPIDs(procName)
 	if len(pids) == 0 {
 		return false, nil
 	}
 	for _, pid := range pids {
-		if err := terminateProcess(pid); err != nil {
+		if err := terminateProcess(pid, procName); err != nil {
 			return true, fmt.Errorf("terminate pid=%d: %w", pid, err)
 		}
 	}
 	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
-		if len(findWorkBuddyPIDs()) == 0 {
+		if len(findClientPIDs(procName)) == 0 {
 			return true, nil
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	return true, fmt.Errorf("WorkBuddy 进程在 %v 内未退出，请手动关闭后重试", wait)
+	return true, fmt.Errorf("%s 进程在 %v 内未退出，请手动关闭后重试", procName, wait)
 }
 
-// launchWorkBuddy 启动官方客户端（分离进程；wb2api 退出不影响它）。
-func launchWorkBuddy() (bool, error) {
-	exe, ok := workBuddyExePath()
+// launchClient 启动 realm 对应的官方客户端（分离进程；wb2api 退出不影响它）。
+func launchClient(realm string) (bool, error) {
+	exe, ok := workBuddyExePath(clientProcName(realm))
 	if !ok {
-		return false, errors.New("未找到 WorkBuddy.exe（请确认已安装；切换本身已成功，手动启动即可）")
+		return false, fmt.Errorf("未找到 %s（请确认已安装；切换本身已成功，手动启动即可）", clientProcName(realm))
 	}
 	// DETACHED_PROCESS：脱离 wb2api 的控制台/作业，窗口正常显示。
 	cmd := exec.Command(exe)
@@ -421,8 +502,8 @@ func launchWorkBuddy() (bool, error) {
 	return true, nil
 }
 
-// findWorkBuddyPIDs 枚举系统进程，返回名字匹配 WorkBuddy.exe 的 PID 列表。
-func findWorkBuddyPIDs() []uint32 {
+// findClientPIDs 枚举系统进程，返回名字匹配 procName 的 PID 列表。
+func findClientPIDs(procName string) []uint32 {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return nil
@@ -433,7 +514,7 @@ func findWorkBuddyPIDs() []uint32 {
 	pe.Size = uint32(unsafe.Sizeof(pe))
 	var out []uint32
 	for err := windows.Process32First(snapshot, &pe); err == nil; err = windows.Process32Next(snapshot, &pe) {
-		if strings.EqualFold(windows.UTF16ToString(pe.ExeFile[:]), workbuddyProcName) {
+		if strings.EqualFold(windows.UTF16ToString(pe.ExeFile[:]), procName) {
 			out = append(out, pe.ProcessID)
 		}
 	}
@@ -457,11 +538,11 @@ func processImageName(pid uint32) string {
 
 // terminateProcess 强制结束进程（TerminateProcess；WorkBuddy 无单实例协议可优雅通知，
 // 与 workbuddy-switch 的 taskkill /F 同级语义）。
-func terminateProcess(pid uint32) error {
+func terminateProcess(pid uint32, procName string) error {
 	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pid)
 	if err != nil {
 		// 打开失败常见于进程刚好自行退出（竞态）：再查一次，已消失则不算失败。
-		if !containsPID(findWorkBuddyPIDs(), pid) {
+		if !containsPID(findClientPIDs(procName), pid) {
 			return nil
 		}
 		return fmt.Errorf("open pid=%d: %w", pid, err)

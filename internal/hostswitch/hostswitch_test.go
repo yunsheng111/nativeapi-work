@@ -190,3 +190,56 @@ func TestAccountsOfFallback(t *testing.T) {
 		t.Fatalf("空对象应为空数组")
 	}
 }
+
+// TestRealmPathDispatch 双 realm 分派：global 切换写 workbuddy-desktop-ai.info，
+// cn 文件不受影响；CurrentForRealm 各读各的，互不串扰。这是"国际版宿主检测"的
+// 核心行为——两版本客户端是独立安装，登录态文件不同、可各自登录不同账号。
+func TestRealmPathDispatch(t *testing.T) {
+	svc, _ := newTestService(t)
+	glPath := svc.authPathGlobal
+	if want := GlobalAuthFilePath(filepath.Dir(svc.authPath)); glPath != want {
+		t.Fatalf("global 路径应与 cn 同目录派生: got %s want %s", glPath, want)
+	}
+	if glPath == svc.authPath {
+		t.Fatalf("global 与 cn 不应指向同一文件")
+	}
+
+	// 分别向两个文件各写一个账号（restart=false 不触碰客户端进程）。
+	if _, err := svc.Switch(Account{UID: "cn-1", AccessToken: "CN-AT", Domain: "copilot.tencent.com"}, false, nil); err != nil {
+		t.Fatalf("cn switch: %v", err)
+	}
+	if _, err := svc.Switch(Account{UID: "gl-1", AccessToken: "GL-AT", Realm: "global", Domain: "www.workbuddy.ai"}, false, nil); err != nil {
+		t.Fatalf("global switch: %v", err)
+	}
+
+	cn, err := svc.CurrentForRealm("cn")
+	if err != nil {
+		t.Fatalf("cn current: %v", err)
+	}
+	if cn.UID != "cn-1" {
+		t.Fatalf("cn 宿主 = %s, want cn-1", cn.UID)
+	}
+	gl, err := svc.CurrentForRealm("global")
+	if err != nil {
+		t.Fatalf("global current: %v", err)
+	}
+	if gl.UID != "gl-1" {
+		t.Fatalf("global 宿主 = %s, want gl-1", gl.UID)
+	}
+
+	// 两个文件都真实存在（global 不是回落到 cn 文件）。
+	for _, p := range []string{svc.authPath, glPath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("%s 应存在: %v", p, err)
+		}
+	}
+
+	// 备份按源文件名派生，国内版/国际版可分。
+	res, err := svc.Switch(Account{UID: "gl-2", AccessToken: "GL-AT2", Realm: "global"}, false, nil)
+	if err != nil {
+		t.Fatalf("second global switch: %v", err)
+	}
+	if res.Backup == "" || !strings.Contains(filepath.Base(res.Backup), "workbuddy-desktop-ai.") {
+		t.Fatalf("global 备份名应含 workbuddy-desktop-ai 前缀, got %s", res.Backup)
+	}
+}

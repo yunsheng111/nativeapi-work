@@ -36,6 +36,16 @@ type TokenUsage struct {
 	LastTokensPerSecond *float64  `json:"last_tokens_per_second,omitempty"`
 	LastUsedAt          time.Time `json:"last_used_at,omitempty"`
 	LastModel           string    `json:"last_model,omitempty"`
+	// 平均值统计（与 Last* 独立，旧 state.json 缺这些字段 → 零值，面板显示 —，
+	// 新请求进来后逐次积累。刻意不复用 request_count/completion_tokens 做分母/
+	// 分子：那两份历史计数没有对应的累计值，混用会把均值稀释成明显失真的错误值）。
+	// SumLatencyMs/LatencyCount：有耗时记录的尝试 → 平均延迟 = sum/lat_count。
+	SumLatencyMs int64 `json:"sum_latency_ms,omitempty"`
+	LatencyCount int64 `json:"latency_count,omitempty"`
+	// ActiveLatencyMs/ActiveCompletionTokens：有产出（completion_tokens>0）的尝试
+	// → 平均速率 = active_completion/(active_latency/1000)，逐对累计保证同口径。
+	ActiveLatencyMs          int64 `json:"active_latency_ms,omitempty"`
+	ActiveCompletionTokens   int64 `json:"active_completion_tokens,omitempty"`
 }
 
 // TokenUsageDelta 是一次聊天账号尝试的 usage 增量。

@@ -44,6 +44,11 @@ type Pool struct {
 	stopCh chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
+	// onChange 状态变更回调：装配层注入，用于向面板推送"池状态变了"。
+	// 在请求热路径上被调用，实现必须非阻塞（面板侧用带缓冲 channel + 非阻塞投递保证）。
+	// nil = 不通知。存 atomic.Value 而非裸函数字段：notify 在持锁与无锁路径都会被调用，
+	// 而 SetOnChange 由装配层在服务启动前写入，两者之间不需要互斥（读多写一次）。
+	onChange atomic.Value // func()
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -131,6 +136,26 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 	p.store = s
 }
 
+// SetOnChange 注入状态变更回调（装配层调用一次）。传 nil 表示取消通知。
+// 回调在池的锁之外被触发（见 notify 的调用点），但可能来自多个并发请求的 goroutine，
+// 实现必须自身并发安全且非阻塞。
+func (p *Pool) SetOnChange(fn func()) {
+	// 显式转换保证存入的永远是 func() 类型：atomic.Value 要求同一类型，且
+	// 直接 Store(nil) 会 panic（interface 为 nil），而带类型的 nil 函数值不会。
+	p.onChange.Store((func())(fn))
+}
+
+// notify 触发变更回调；未注入时为空操作。调用方可能持 p.mu，因此回调实现
+// 不得回调 Pool 的加锁方法（面板侧只做 channel 投递，不碰 Pool）。
+// 用 Load 而非 CAS：回调只被整体替换，不存在"读-改-写"竞争。
+// 调用点不区分"是否真的改了状态"：少数提前返回（账号已不存在等）也会触发一次空通知，
+// 订阅端按"合并"语义处理（收到信号即重取快照），多一次通知无害。
+func (p *Pool) notify() {
+	if fn, ok := p.onChange.Load().(func()); ok && fn != nil {
+		fn()
+	}
+}
+
 // RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
 // 无快照、快照无 savedAt、或本地不存在/不可读时，都会被判定为"本地优先/跳过快照"，
 // 同时打一条恢复来源日志。必须在 SyncToDir 之前调用（SyncToDir 只增删不入值）。
@@ -145,6 +170,7 @@ func (p *Pool) Acquire(uid string) bool {
 	if limit <= 0 {
 		// 不限：计数仍累加（供状态观测），但永不拒绝。
 		e.inFlight.Add(1)
+		p.notify()
 		return true
 	}
 	for {
@@ -153,6 +179,7 @@ func (p *Pool) Acquire(uid string) bool {
 			return false
 		}
 		if e.inFlight.CompareAndSwap(cur, cur+1) {
+			p.notify()
 			return true
 		}
 	}
@@ -172,6 +199,7 @@ func (p *Pool) Release(uid string) {
 			return
 		}
 		if e.inFlight.CompareAndSwap(cur, cur-1) {
+			p.notify()
 			return
 		}
 	}
