@@ -1,10 +1,22 @@
-// reqlog.go 请求日志库：内存窗口 + 磁盘 JSONL 按天分段 + 24h 保留。
+// reqlog.go 请求日志库：内存窗口 + 磁盘 JSONL 按小时分段 + 24h（1 天）保留。
 //
 // 对话表格行（server/logChatRow）经 Ring.chatSink 回调进入这里：内存保留最近
-// 24h 全量条目（上限 20000 条，超出淘汰最旧），同时按天追加到 logs 目录的
-// requests-YYYYMMDD.jsonl 分段文件；进程重启时从昨天+今天两份分段载入种子，
-// 因此「监控」视图的 24h 窗口跨重启连续。sweep 每小时清理：内存淘汰超期条目、
-// 磁盘删除早于昨天的分段文件。
+// 24h 全量条目（上限 20000 条，超出淘汰最旧），同时按小时追加到 logs 目录的
+// requests-YYYYMMDDHH.jsonl 分段文件。
+//
+// 保留口径只有一条：reqLogRetain（24h）。内存与磁盘都按它判过期，不做第二套规则。
+//   - 内存：每次 Write 与每次 sweep 淘汰早于 cutoff 的条目。有流量时窗口恒 ≤24h；
+//     完全静默时最长可到 24h + 一个 sweep 周期（15min）才被淘汰。
+//   - 磁盘：sweep 删除「最后一次可能写入的时刻 <= cutoff」的分段文件。驻留长度由
+//     分段跨度决定——按小时分段时最多 25 个文件、最旧数据约 25h（不是 24h，因为
+//     最后一份落在窗口内的分段可能只被窗口覆盖了一小部分）；旧版按天分段（一个文件
+//     覆盖 24h）最坏会留下两份「今天+昨天」文件，≈48h 原始数据，与「只留 1 天」不符，
+//     故改为小时粒度。
+//   - 触发时机：NewReqLog 启动即清理一次，此后每 sweepInterval（15min）一次。
+//
+// 重启种子：扫描目录内全部分段，只读「与保留窗口有交集」的文件，再按 cutoff 逐条
+// 过滤，因此 24h 窗口跨重启连续。旧版按天分段仍可被识别与读取（按 24h 跨度参与
+// 过期判定），升级不丢历史，且旧文件最终会被清掉。
 //
 // dir 为空 = 纯内存模式（测试与裸用场景），不落盘、不启动 sweep。
 package panel
@@ -23,22 +35,70 @@ import (
 
 const (
 	// reqLogCap 内存条目上限：24h 高流量下不易触顶；触顶按 FIFO 淘汰最旧。
+	// 注意这是容量护栏而非保留口径——极端流量下它会先于 24h 生效，此时「全部日志」
+	// 指最近 reqLogCap 条。
 	reqLogCap = 20000
-	// reqLogRetain 条目保留窗口。磁盘分段保留今天+昨天两天文件（≈24h+余量），
-	// 精确的 24h 边界由内存淘汰执行。
+	// reqLogRetain 条目保留窗口 = 1 天。内存与磁盘共用这一个口径。
 	reqLogRetain = 24 * time.Hour
-	// sweepInterval sweep 周期：清理是低频维护动作，一小时一次足够。
-	sweepInterval = time.Hour
+	// sweepInterval sweep 周期。它决定"到期后多久被删"，不决定驻留长度（后者由分段
+	// 跨度决定）；15min 的代价是每分钟 1/4 次空转（一次 glob + 至多 2 万条内存过滤），
+	// 可忽略。
+	sweepInterval = 15 * time.Minute
 
-	dayLayout         = "20060102"  // 分段文件名里的日期段
+	segLayout         = "2006010215" // 分段文件名里的时间戳段（小时粒度）
+	legacySegLayout   = "20060102"   // 旧版按天分段的时间戳段：仅用于识别与清理
+	segSpan           = time.Hour    // 小时分段覆盖的时长
+	legacySegSpan     = 24 * time.Hour
 	segPrefix         = "requests-" // 分段文件名前缀
 	segSuffix         = ".jsonl"    // 分段文件名后缀
 	queryLimitDefault = 200         // Query 未指定 limit 时的默认页大小
 	queryLimitMax     = 2000        // Query 单页上限
 )
 
-// segName 分段文件名：requests-YYYYMMDD.jsonl（本地日期）。
-func segName(day string) string { return segPrefix + day + segSuffix }
+// segName 分段文件名：requests-YYYYMMDDHH.jsonl（本地时间，小时粒度）。
+func segName(t time.Time) string { return segPrefix + t.Format(segLayout) + segSuffix }
+
+// parseSeg 解析分段文件名 → 覆盖区间 [start, start+span)。
+// span 由名字里的时间戳精度决定：10 位 = 小时分段（1h），8 位 = 旧版按天分段（24h）。
+// 不符合命名约定的名字返回 ok=false，调用方据此跳过——目录里人工放置的文件绝不误删。
+func parseSeg(name string) (start time.Time, span time.Duration, ok bool) {
+	if !strings.HasPrefix(name, segPrefix) || !strings.HasSuffix(name, segSuffix) {
+		return time.Time{}, 0, false
+	}
+	stem := name[len(segPrefix) : len(name)-len(segSuffix)]
+	layout, dur := segLayout, segSpan
+	switch len(stem) {
+	case len(legacySegLayout):
+		layout, dur = legacySegLayout, legacySegSpan
+	case len(segLayout):
+	default:
+		return time.Time{}, 0, false
+	}
+	t, err := time.ParseInLocation(layout, stem, time.Local)
+	if err != nil {
+		return time.Time{}, 0, false
+	}
+	// 回写比对：time.Parse 会把越界日期归一化（20260230 → 03-02），归一化后的名字
+	// 不等于原串，说明这不是我们生成的文件——按约定拒绝，避免把它当合法分段删掉。
+	if t.Format(layout) != stem {
+		return time.Time{}, 0, false
+	}
+	return t, dur, true
+}
+
+// segEnd 分段"最后一次可能写入"的时刻，过期判定以它为准。
+//   - 小时分段：写满即封存，端点就是 start+1h。
+//   - 旧版按天分段：文件已冻结不再增长，用 mtime（= 最后一次写入）比 start+24h 更准。
+//     按 start+24h 判定时，升级当天那份文件要等到 D+2 零点才过期（最坏残留 ~48h），
+//     与"只留 1 天"不符；mtime 取不到时回退到 start+span——偏晚，只会多留不会误删。
+func segEnd(path string, start time.Time, span time.Duration) time.Time {
+	if span == legacySegSpan {
+		if fi, err := os.Stat(path); err == nil {
+			return fi.ModTime()
+		}
+	}
+	return start.Add(span)
+}
 
 // ChatEntry 增补说明：InTokens（prompt tokens，-1 缺失）与 Err（失败原因短文本）
 // 由 server/logChatRow 的表格行解析而来，见 ring.parseChatRow。
@@ -49,16 +109,16 @@ type ReqLog struct {
 	dir     string      // 空 = 纯内存模式
 	entries []ChatEntry // 时间升序（追加序即时间序；种子载入时已排序）
 
-	file    *os.File // 当天分段文件句柄（内存模式恒 nil）
-	fileDay string   // 句柄对应的分段日期，换天重开
+	file    *os.File // 当前小时分段文件句柄（内存模式恒 nil）
+	fileSeg string   // 句柄对应的分段起点（segLayout 串），换小时重开
 	warned  bool     // 写盘失败告警防抖：首个失败打一次，成功重开后复位
 
 	sweepTimer *time.Timer
 	closed     bool
 }
 
-// NewReqLog 构建请求日志库。dir 为空 = 纯内存模式；否则创建目录、载入种子数据
-// 并启动每小时 sweep。
+// NewReqLog 构建请求日志库。dir 为空 = 纯内存模式；否则创建目录、清一次过期分段、
+// 载入种子数据并启动周期 sweep。
 func NewReqLog(dir string) *ReqLog {
 	rl := &ReqLog{dir: dir}
 	if dir == "" {
@@ -69,6 +129,7 @@ func NewReqLog(dir string) *ReqLog {
 		log.Printf("reqlog: 创建日志目录 %s 失败: %v（请求日志退化为纯内存）", dir, err)
 		return rl
 	}
+	rl.pruneFiles() // 启动即清一次：停机期间过期的分段不必等到第一个 sweep 周期
 	rl.mu.Lock()
 	rl.seed()
 	rl.scheduleSweepLocked()
@@ -76,17 +137,24 @@ func NewReqLog(dir string) *ReqLog {
 	return rl
 }
 
-// seed 启动载入：读昨天+今天两份分段（存在才读），坏行跳过，只保留 24h 内条目，
-// 按 ts 升序放回内存（容量超限淘汰最旧）。
+// seed 启动载入：读「与保留窗口有交集」的全部分段（存在才读），坏行跳过，只保留
+// 24h 内条目，按 ts 升序放回内存（容量超限淘汰最旧）。
 func (rl *ReqLog) seed() {
 	now := time.Now()
 	cutoff := now.Add(-reqLogRetain)
-	days := []string{now.AddDate(0, 0, -1).Format(dayLayout), now.Format(dayLayout)}
+	matches, err := filepath.Glob(filepath.Join(rl.dir, segPrefix+"*"+segSuffix))
+	if err != nil {
+		return
+	}
 	var loaded []ChatEntry
-	for _, day := range days {
-		data, err := os.ReadFile(filepath.Join(rl.dir, segName(day)))
+	for _, path := range matches {
+		start, span, ok := parseSeg(filepath.Base(path))
+		if !ok || !start.Add(span).After(cutoff) {
+			continue // 不合命名约定，或整段都落在窗口之外：不必读
+		}
+		data, err := os.ReadFile(path)
 		if err != nil {
-			continue // 分段不存在是常态（首启/停机一天以上），静默跳过
+			continue
 		}
 		for _, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimSpace(line)
@@ -133,21 +201,21 @@ func (rl *ReqLog) Write(ce ChatEntry) {
 	rl.appendFileLocked(ce)
 }
 
-// appendFileLocked 追加到当天分段；跨天（或首写）重开句柄。
+// appendFileLocked 追加到当前小时分段；跨小时（或首写）重开句柄。
 // 调用方必须已持 rl.mu：句柄的打开/关闭与 Query/Close 共享同一临界区。
 func (rl *ReqLog) appendFileLocked(ce ChatEntry) {
 	if rl.dir == "" {
 		return
 	}
-	day := ce.TS.Format(dayLayout)
-	if rl.file == nil || day != rl.fileDay {
+	seg := ce.TS.Format(segLayout)
+	if rl.file == nil || seg != rl.fileSeg {
 		rl.closeFileLocked()
-		f, err := os.OpenFile(filepath.Join(rl.dir, segName(day)), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		f, err := os.OpenFile(filepath.Join(rl.dir, segName(ce.TS)), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
 			rl.warnWriteFailLocked(err)
 			return
 		}
-		rl.file, rl.fileDay = f, day
+		rl.file, rl.fileSeg = f, seg
 		rl.warned = false // 重开成功即恢复告警能力：下次持续失败仍能提醒一次
 	}
 	data, err := json.Marshal(ce)
@@ -175,7 +243,7 @@ func (rl *ReqLog) closeFileLocked() {
 	if rl.file != nil {
 		_ = rl.file.Close()
 		rl.file = nil
-		rl.fileDay = ""
+		rl.fileSeg = ""
 	}
 }
 
@@ -207,8 +275,7 @@ func (rl *ReqLog) scheduleSweepLocked() {
 	})
 }
 
-// sweep 周期清理：内存淘汰超 24h 条目；磁盘删除日期早于昨天的分段文件
-// （day < yesterday 即删，磁盘最多留今天+昨天两份 ≈ 24h + 跨天余量）。
+// sweep 周期清理：内存淘汰超 24h 条目；磁盘删除整段都在 24h 窗口之外的分段文件。
 func (rl *ReqLog) sweep() {
 	rl.mu.Lock()
 	rl.pruneLocked()
@@ -229,23 +296,35 @@ func (rl *ReqLog) pruneLocked() {
 	rl.entries = kept
 }
 
-// pruneFiles 删除过期分段文件。只匹配分段命名模式的文件，目录里的其他文件不碰。
+// pruneFiles 删除过期分段文件。判定口径与 seed 同源（parseSeg 决定区间），过期以
+// segEnd 为准。只匹配分段命名模式，目录里的其他文件一概不碰；正在写的分段跳过——
+// Windows 上句柄未关时 os.Remove 必然失败（每轮 sweep 刷一条错误日志），Linux 上
+// unlink 会成功但后续写入静默落进已删除的 inode（丢数据且不报错）。
 func (rl *ReqLog) pruneFiles() {
 	if rl.dir == "" {
 		return
 	}
-	yesterday := time.Now().AddDate(0, 0, -1).Format(dayLayout)
+	cutoff := time.Now().Add(-reqLogRetain)
+	rl.mu.Lock()
+	active := ""
+	if rl.fileSeg != "" {
+		active = segPrefix + rl.fileSeg + segSuffix
+	}
+	rl.mu.Unlock()
 	matches, err := filepath.Glob(filepath.Join(rl.dir, segPrefix+"*"+segSuffix))
 	if err != nil {
 		return
 	}
 	for _, path := range matches {
-		day := filepath.Base(path)
-		day = strings.TrimSuffix(strings.TrimPrefix(day, segPrefix), segSuffix)
-		if len(day) != 8 {
-			continue // 不合命名约定的文件不删（可能是人工放置的对照数据）
+		name := filepath.Base(path)
+		if name == active {
+			continue
 		}
-		if day < yesterday { // YYYYMMDD 字典序即时间序
+		start, span, ok := parseSeg(name)
+		if !ok {
+			continue
+		}
+		if !segEnd(path, start, span).After(cutoff) {
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				log.Printf("reqlog: 删除过期分段 %s 失败: %v", path, err)
 			}
@@ -323,7 +402,14 @@ func (rl *ReqLog) Query(o QueryOpts) ([]ChatEntry, int, Stats) {
 	}
 	st := computeStats(filtered)
 	// 降序（最新在前）后切片分页：监控视图首屏只看最近一页。
-	sort.Slice(filtered, func(i, j int) bool { return filtered[i].TS.After(filtered[j].TS) })
+	// 同 ts 条目按 Seq 降序兜底：sort.Slice 不稳定，只比 ts 时同 ts 的相对次序可能
+	// 逐次不同（同一毫秒完成的多个请求很常见），offset 分页下会让相邻两页重复或漏行。
+	sort.Slice(filtered, func(i, j int) bool {
+		if !filtered[i].TS.Equal(filtered[j].TS) {
+			return filtered[i].TS.After(filtered[j].TS)
+		}
+		return filtered[i].Seq > filtered[j].Seq
+	})
 	limit := o.Limit
 	if limit <= 0 {
 		limit = queryLimitDefault

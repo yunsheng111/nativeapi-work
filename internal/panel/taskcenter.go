@@ -23,6 +23,10 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
+// scanFanout 全账号扫描的上游并发上限。账号数少时无感；账号多时避免一次扫描把
+// 2N 个请求同时压给上游（触发限流/WAF），也让「扫描中…」的等待时间可预期。
+const scanFanout = 4
+
 // ---------------------------------------------------------------------------
 // 扫描（只读）
 // ---------------------------------------------------------------------------
@@ -75,6 +79,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	states := p.cfg.Pool.List()
 	items := make([]scanAccountItem, len(states))
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, scanFanout)
 	for i, st := range states {
 		if st.Disabled {
 			continue
@@ -82,6 +87,8 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, uid string) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			a := p.cfg.Pool.AuthByUID(uid)
 			if a == nil {
 				return
@@ -186,15 +193,13 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 
 	// 扫描待办（复用扫描逻辑的拉取部分）。
 	states := p.cfg.Pool.List()
-	type acct struct {
-		a      *auth.Auth
-		grow   []upstream.Task
-		school bool
-	}
-	var accts []queueAccount
+	// 按账号池下标落位（并发写各不相交），队列顺序因此稳定；原 append + 互斥锁的写法
+	// 会让账号顺序随 goroutine 调度漂移，与下面"保持顺序"的注释不符。
+	slots := make([]queueAccount, len(states))
+	kept := make([]bool, len(states))
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	for _, st := range states {
+	sem := make(chan struct{}, scanFanout)
+	for i, st := range states {
 		if st.Disabled {
 			continue
 		}
@@ -203,8 +208,10 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		wg.Add(1)
-		go func(a *auth.Auth, wantSchool bool) {
+		go func(i int, a *auth.Auth, wantSchool bool) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			one := queueAccount{a: a}
 			// D4 门控：global 账号无 CN 成长/开学季任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
@@ -233,15 +240,20 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if len(one.grow) > 0 || one.school {
-				mu.Lock()
-				accts = append(accts, one)
-				mu.Unlock()
+				slots[i] = one
+				kept[i] = true
 			}
-		}(a, body.School)
+		}(i, a, body.School)
 	}
 	wg.Wait()
 
-	// 组装队列（账号分组，保持顺序）。
+	// 组装队列（账号分组，保持账号池顺序）。
+	accts := slots[:0]
+	for i := range slots {
+		if kept[i] {
+			accts = append(accts, slots[i])
+		}
+	}
 	var items []queueItem
 	for _, one := range accts {
 		for _, t := range one.grow {
@@ -304,7 +316,10 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 			if accepted := p.acceptPendingTasks(one.a); accepted > 0 {
 				time.Sleep(reportGap) // 给上游状态流转留时间
 			}
-			for i := range q.items {
+			// 用入参切片遍历，不在锁外读 q.items：q.items 只在启动时整体赋值一次，
+			// 锁外读切片头本身不构成竞争，但那是隐性约定——将来一旦改成 append，
+			// 这里立刻变成真竞争（-race 能抓到）。
+			for i := range items {
 				uid, kind, code := q.snapshotAt(i)
 				if uid != one.a.UID {
 					continue

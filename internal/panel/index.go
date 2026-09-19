@@ -116,19 +116,25 @@ const csp = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inl
 	"frame-ancestors 'none'; base-uri 'none'"
 
 // setSecurityHeaders 写入面板统一安全响应头（页面与 API 都要，API 也含 JSON 数据）。
-func setSecurityHeaders(w http.ResponseWriter) {
+// API 响应额外禁缓存：监控的 chatlogs 查询串里 to= 是分钟精度，同一分钟内的
+// 刷新 URL 相同，WebView2/浏览器会启发式缓存旧响应——SSE 通知前端刷新时拿到
+// 的还是缓存里的旧数据，「实时刷新」表现为慢一拍。no-store 明确掐掉这条路径。
+func setSecurityHeaders(w http.ResponseWriter, isAPI bool) {
 	w.Header().Set("Content-Security-Policy", csp)
 	w.Header().Set("X-Content-Type-Options", "nosniff") // 禁 MIME 嗅探
 	w.Header().Set("X-Frame-Options", "DENY")           // 老浏览器兜底（CSP frame-ancestors 的等价项）
 	w.Header().Set("Referrer-Policy", "no-referrer")    // 不外泄面板地址给外部站点
 	w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	if isAPI {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 }
 
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 // devDir 模式下注入版本号给前端轮询：内容变化 → 前端自动 reload，免构建免手动刷新。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
+	setSecurityHeaders(w, false)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	index, _, devVer := p.dev.load(time.Now())
 	if devVer == "" {
@@ -159,7 +165,7 @@ func replaceOnce(s, old, new string) string {
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
+	setSecurityHeaders(w, false)
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	_, app, devVer := p.dev.load(time.Now())
 	if devVer != "" {
@@ -177,7 +183,7 @@ func (p *Panel) devVersionHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	setSecurityHeaders(w)
+	setSecurityHeaders(w, false)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(devVer))

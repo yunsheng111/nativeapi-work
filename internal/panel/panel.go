@@ -192,6 +192,21 @@ func New(cfg Config) *Panel {
 // Logs 返回日志环形缓冲（main 经 MultiWriter 镜像 log 与 chat 表格日志进来）。
 func (p *Panel) Logs() *Ring { return p.logs }
 
+// NotifyRequestLogged 请求日志落库后主动推一帧变更信号（复用池变更的 SSE 通道）。
+//
+// 必要性：失败请求若在**选号之前**就终止（无可用账号、模型不被任何账号支持等），
+// 全程不经过 Acquire/NoteError/Release，因而没有任何池状态变更通知——「错误请求」
+// 页签就会一直停在旧数据上（表现为"错误请求不实时更新"）。日志落库本身是"有新内容"
+// 的权威信号，与池状态无关，故在此补发一帧。
+//
+// 与池通知共用同一条流：前端按"合并"语义处理（前沿立即刷 + 120ms 尾随防抖），
+// 一个请求多推一帧不会增加取数次数。调用点在 Ring 的锁外回调路径上，非阻塞。
+func (p *Panel) NotifyRequestLogged() {
+	if p.events != nil {
+		p.events.Notify()
+	}
+}
+
 func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
@@ -248,8 +263,10 @@ func (p *Panel) routes() {
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
 // 与 401 错误响应全都带上（API 也可能在浏览器里被直接打开）。
+// API 路径额外禁缓存（见 setSecurityHeaders 注释）：监控查询串分钟粒度变化，
+// 不禁缓存时同一分钟内的刷新会命中 WebView2 缓存的旧响应。
 func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
+	setSecurityHeaders(w, strings.HasPrefix(r.URL.Path, "/panel/api/"))
 	p.mux.ServeHTTP(w, r)
 }
 
@@ -398,6 +415,31 @@ func tryParseTime(s string) time.Time {
 	return time.Time{}
 }
 
+// parseTimeUpper 解析查询的**时间上界**：输入按分钟/秒精度截断时，补足到该精度的
+// 最后一刻再返回。
+//
+// 必要性：前端 monWindow() 的 to 由 toLocalInput 生成（YYYY-MM-DDTHH:mm，无秒），
+// 若按该分钟第 0 秒当上界，同一分钟内完成的请求会被 Query 的 e.TS.After(o.To)
+// 整体丢弃——症状是「请求完成后明细不刷新、手动点刷新也没反应、跨到下一分钟才
+// 出现」。本面板的时间窗上界恒为"现在"（monRange 只有 1h/6h/24h/today 四个预设），
+// 故把上界补足到精度末尾不会引入任何未来数据，只是让"截至现在"真正成立。
+//
+// 秒精度同理：e.TS 带毫秒，按整秒当上界会丢掉同一秒内 999ms 的部分。
+// RFC3339 与 unix 毫秒不走补足——调用方给出的是明确瞬时点，语义由调用方负责。
+func parseTimeUpper(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}
+	}
+	if t, err := time.ParseInLocation("2006-01-02T15:04", s, time.Local); err == nil {
+		return t.Add(time.Minute - time.Nanosecond)
+	}
+	if t, err := time.ParseInLocation("2006-01-02T15:04:05", s, time.Local); err == nil {
+		return t.Add(time.Second - time.Nanosecond)
+	}
+	return tryParseTime(s)
+}
+
 // chatLogsHandler 监控视图的请求日志查询：服务端按时间/账号/模型/模式/状态筛选
 // 并分页（数据源是 ReqLog 的 24h 持久化窗口，单页量有界），随响应附带过滤结果
 // 的聚合指标（req/ok/err/token 合计/平均耗时），前端不再自行全量计算。
@@ -405,7 +447,7 @@ func (p *Panel) chatLogsHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	opts := QueryOpts{
 		From:   tryParseTime(q.Get("from")),
-		To:     tryParseTime(q.Get("to")),
+		To:     parseTimeUpper(q.Get("to")),
 		UID:    q.Get("uid"),
 		Model:  q.Get("model"),
 		Mode:   q.Get("mode"),
@@ -424,7 +466,7 @@ func (p *Panel) chatLogsHandler(w http.ResponseWriter, r *http.Request) {
 // 按模型/账号的用量排行 + 总量指标。缺省窗口 = 最近 24h。
 func (p *Panel) usageStatsHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	from, to := tryParseTime(q.Get("from")), tryParseTime(q.Get("to"))
+	from, to := tryParseTime(q.Get("from")), parseTimeUpper(q.Get("to"))
 	if from.IsZero() {
 		from = time.Now().Add(-24 * time.Hour)
 	}

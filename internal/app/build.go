@@ -252,8 +252,8 @@ func Build(cfg *Config, cfgPath string) (*Instance, error) {
 		}
 		return nil
 	}
-	// 请求日志持久化：内存 24h 窗口 + logs/ 目录 JSONL 按天分段。相对工作目录——
-	// 桌面端 main 已把 CWD 锚到 exe 目录，服务端与数据目录同源。
+	// 请求日志持久化：内存 24h 窗口 + logs/ 目录 JSONL 按小时分段（保留最近 1 天）。
+	// 相对工作目录——桌面端 main 已把 CWD 锚到 exe 目录，服务端与数据目录同源。
 	reqlog := panel.NewReqLog("logs")
 
 	pn := panel.New(panel.Config{
@@ -358,7 +358,13 @@ func (i *Instance) StartLogMirror() {
 	log.SetOutput(io.MultiWriter(os.Stderr, i.Panel.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, i.Panel.Logs()))
 	if i.reqlog != nil {
-		i.Panel.Logs().SetChatSink(i.reqlog.Write)
+		// 先落库、再通知：失败请求可能在选号之前就终止（无可用账号/模型不支持），
+		// 不产生任何池状态变更，只靠池通知会让「错误请求」页签停在旧数据上。
+		// 日志落库是与池状态无关的"有新内容"信号，故在其后补推一帧。
+		i.Panel.Logs().SetChatSink(func(ce panel.ChatEntry) {
+			i.reqlog.Write(ce)
+			i.Panel.NotifyRequestLogged()
+		})
 	}
 }
 

@@ -499,8 +499,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	realm, bareModel := resolveModel(peek.Model)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
+	// 落库时机由下方的"日志先落库、租约后释放"决定：defer 注册点被刻意排在租约
+	// 释放之后（LIFO 下注册晚的先执行），保证执行顺序是"先写日志行，再通知池变更"。
 	st := newChatStat(time.Now(), body, peek.Stream)
-	defer st.done()
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -541,6 +542,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			h.cfg.Pool.Release(heldUID)
 		}
 	}()
+	// 日志落库必须早于租约释放：Release 会触发池变更通知（经 SSE 推到面板），
+	// 前端收到通知立刻拉取请求明细/用量。若此时这一行的表格日志还没写出去，
+	// 那一拍刷新就取不到刚完成的请求。defer 是 LIFO——注册晚的先执行，故把
+	// st.done() 注册在租约 defer 之后。
+	defer st.done()
 	releaseHeld := func() {
 		if heldUID != "" {
 			h.cfg.Pool.Release(heldUID)

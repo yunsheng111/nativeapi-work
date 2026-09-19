@@ -150,3 +150,35 @@ func tryLine(lines <-chan string, d time.Duration) (string, bool) {
 		return "", false
 	}
 }
+
+// TestChatSinkWriteNotifies 覆盖装配层的组合语义：对话日志落库后必须补推一帧变更信号。
+//
+// 回归场景：失败请求可能在**选号之前**就终止（无可用账号/模型不被支持），全程不经过
+// Acquire/NoteError/Release，因而没有任何池状态变更通知——只靠池事件驱动时，「错误
+// 请求」页签会一直停在旧数据上。这里用 uid=- 的失败行复刻该场景。
+func TestChatSinkWriteNotifies(t *testing.T) {
+	rl := NewReqLog("")
+	defer rl.Close()
+	p := New(Config{Version: "test", ReqLog: rl})
+	ch, cancel := p.events.Subscribe()
+	defer cancel()
+
+	// 复刻 app.StartLogMirror 的接线：先落库，再通知。
+	p.Logs().SetChatSink(func(ce ChatEntry) {
+		rl.Write(ce)
+		p.NotifyRequestLogged()
+	})
+
+	// 一行选号失败的对话日志：uid=- 表示未选中任何账号。
+	p.Logs().Write([]byte("| #1 | 19:00:00 | cn:glm-5.2 | sync | 503 | uid=- |" +
+		" TTFB=- | in=- | out=- | -tok/s | total=0.0s | err=no_healthy_account |\n"))
+
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("chatSink 落库后未推送变更信号（错误请求页签将无法自动刷新）")
+	}
+	if _, total, _ := rl.Query(QueryOpts{}); total != 1 {
+		t.Fatalf("对话日志未落库：total=%d want 1", total)
+	}
+}

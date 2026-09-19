@@ -348,6 +348,13 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 }
 .flt-stats b { font-weight: 600; color: var(--ink); }
 .flt-stats .bad { color: var(--bad); }
+/* 分页条：左侧统计文案、右侧页码导航同排。页码输入框与每页条数下拉必须显式定宽，
+   否则会被全局 input/select 的 width:100% 撑开，把统计文案挤走。 */
+.flt-stats .grow { flex: 1; }
+.flt-stats .pager { display: flex; align-items: center; gap: 6px; }
+.flt-stats .pager .pg-in { width: 56px; padding: 3.5px 6px; font-size: 12.5px; text-align: center; }
+.flt-stats .pager .pg-info { white-space: nowrap; }
+.flt-stats .pager .pg-sel { width: auto; padding: 3.5px 8px; font-size: 12.5px; }
 .chat-wrap { max-height: 480px; overflow: auto; }
 /* 固定布局 + colgroup：模式/状态列的 tag 是 inline-flex，其 max-content 贡献会让
    自动表格布局把全部富余宽度灌进单列；fixed 布局按 colgroup 分配，富余宽度均匀
@@ -759,8 +766,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div class="chat-wrap">
           <table class="acc chat">
+            <!-- 列宽按"实测内容宽 + 22px 内边距"定，不允许无 title 的列被省略号裁掉。
+                 时间列必须容纳最宽的跨天格式 12-31 23:59:59（mono 12px 下 98.44px，+22 得
+                 121px）；类型列的标签药丸（非流式 54.5px）被裁会切掉圆角。这两列都没有
+                 title 可回退，所以必须给足；模型/账号/错误列都有 title 全文，可安全截断。
+                 错误列不设固定宽是有意的：实测它 95% 的行是空的占位符（内容宽中位数仅
+                 7px），固定占 190px 等于把富余宽度锁死。改成不指定宽度后，富余宽度由它和
+                 模型列平分——桌面端默认窗口 1200×800 下表格 888px、固定列合计 612px、
+                 两列各得 138px；窗口越宽它涨得越快（1440 下各 258px），错误全文越容易看全。 -->
             <colgroup>
-              <col style="width:80px"><col><col style="width:140px"><col style="width:72px"><col style="width:62px"><col style="width:92px"><col style="width:118px"><col style="width:190px">
+              <col style="width:122px"><col><col style="width:140px"><col style="width:78px"><col style="width:62px"><col style="width:92px"><col style="width:118px"><col>
             </colgroup>
             <thead><tr>
               <th>时间</th><th>模型</th><th>账号</th><th>类型</th><th>状态</th><th>Token</th><th>响应性能</th><th>错误</th>
@@ -768,7 +783,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <tbody id="monBody"></tbody>
           </table>
         </div>
-        <div class="flt-stats" id="monNote">共 — 条 · 内存与磁盘保留 24 小时</div>
+        <div class="flt-stats" id="monFoot">
+          <span id="monNote">共 — 条 · 内存与磁盘保留最近 24 小时</span>
+          <span class="grow"></span>
+          <span class="pager">
+            <button class="xs" type="button" id="monPgFirst" title="首页" disabled>«</button>
+            <button class="xs" type="button" id="monPgPrev" title="上一页" disabled>‹</button>
+            <input class="pg-in" type="number" id="monPgInput" min="1" value="1" aria-label="页码">
+            <span class="pg-info" id="monPgInfo">第 1 / 1 页</span>
+            <button class="xs" type="button" id="monPgNext" title="下一页" disabled>›</button>
+            <button class="xs" type="button" id="monPgLast" title="末页" disabled>»</button>
+            <select class="pg-sel" id="monPgSize" aria-label="每页条数">
+              <option value="50">50 条/页</option>
+              <option value="100" selected>100 条/页</option>
+              <option value="200">200 条/页</option>
+              <option value="500">500 条/页</option>
+            </select>
+          </span>
+        </div>
       </div>
 
       <!-- 用量分析：概览卡 + 趋势图 + 模型/账号分布 -->

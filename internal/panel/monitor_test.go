@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -110,6 +111,41 @@ func TestChatLogsAPIQuery(t *testing.T) {
 	}
 }
 
+// TestChatLogsAPIPagination 分页契约：前端按 ceil(total/limit) 页逐页翻完，必须
+// 不重不漏地覆盖全量，且 total 在各页保持一致（页数计算只依赖它）；越界 offset
+// 返回空页而不是报错。
+func TestChatLogsAPIPagination(t *testing.T) {
+	p, rl, now := newMonitorPanel(t)
+	// 补到 7 条，凑出除不尽的三页（limit=3）。
+	for i := 3; i <= 7; i++ {
+		rl.Write(ChatEntry{Seq: int64(i), TS: now.Add(-time.Duration(8-i) * time.Minute), Model: "cn:glm-5.2",
+			Mode: "stream", UID: "aaaaaaaa", Status: 200, TTFBMs: 100, InTokens: 10, Tokens: 20})
+	}
+	const limit = 3
+	seen := map[float64]bool{}
+	for offset := 0; offset < 9; offset += limit {
+		resp := getJSON(t, p, "/panel/api/chatlogs?limit=3&offset="+strconv.Itoa(offset))
+		if int(resp["total"].(float64)) != 7 {
+			t.Fatalf("offset=%d: total=%v want 7（各页口径必须一致）", offset, resp["total"])
+		}
+		for _, raw := range resp["entries"].([]any) {
+			seq := raw.(map[string]any)["seq"].(float64)
+			if seen[seq] {
+				t.Fatalf("seq=%v 跨页重复", seq)
+			}
+			seen[seq] = true
+		}
+	}
+	if len(seen) != 7 {
+		t.Fatalf("翻完全部页码只覆盖 %d 条，want 7", len(seen))
+	}
+	// 越界 offset：空页 + total 不变（前端靠 total 收敛页码，不能靠报错兜底）。
+	resp := getJSON(t, p, "/panel/api/chatlogs?limit=3&offset=99")
+	if len(resp["entries"].([]any)) != 0 || int(resp["total"].(float64)) != 7 {
+		t.Fatalf("offset beyond end: entries=%v total=%v", resp["entries"], resp["total"])
+	}
+}
+
 // TestUsageStatsAPI 桶结构与补零、排行顺序、缺省窗口回退 24h。
 func TestUsageStatsAPI(t *testing.T) {
 	rl := NewReqLog("")
@@ -206,5 +242,74 @@ func TestMetricsAPI(t *testing.T) {
 	}
 	if int(m["accounts_total"].(float64)) != 0 || int(m["accounts_healthy"].(float64)) != 0 {
 		t.Fatalf("accounts: %v/%v", m["accounts_total"], m["accounts_healthy"])
+	}
+}
+
+// monQueryURL 按前端 monWindow() 的等价口径构造查询串：from/to 均为分钟精度
+// （app.js toLocalInput → YYYY-MM-DDTHH:mm，无秒）。
+func monQueryURL(path string, from, to time.Time) string {
+	v := url.Values{}
+	v.Set("from", from.Format("2006-01-02T15:04"))
+	v.Set("to", to.Format("2006-01-02T15:04"))
+	return path + "?" + v.Encode()
+}
+
+// TestChatLogsUpperBoundCoversCurrentMinute 回归「当前分钟内的请求不可见」。
+// 前端 to 是分钟精度，若服务端按该分钟第 0 秒当上界，同分钟内完成的请求会被
+// Query 的 e.TS.After(o.To) 丢弃——表现为请求完成后明细不刷新、手动点刷新也没
+// 反应、跨到下一分钟才出现。上界必须覆盖到该精度的最后一刻。
+func TestChatLogsUpperBoundCoversCurrentMinute(t *testing.T) {
+	rl := NewReqLog("")
+	defer rl.Close()
+	// 固定在第 30 秒，避免测试自身跨分钟边界时行为漂移。
+	minute := time.Date(2026, 9, 17, 17, 29, 0, 0, time.Local)
+	rl.Write(ChatEntry{Seq: 1, TS: minute.Add(30 * time.Second), Model: "cn:glm-5.2", Mode: "stream",
+		UID: "aaaaaaaa", Status: 200, TTFBMs: 10, InTokens: 1, Tokens: 2, TotalSec: 1})
+	p := New(Config{Version: "test", ReqLog: rl})
+
+	m := getJSON(t, p, monQueryURL("/panel/api/chatlogs", minute.Add(-time.Hour), minute))
+	if got := int(m["total"].(float64)); got != 1 {
+		t.Fatalf("同分钟内完成的请求被 to 上界丢弃：total=%d want 1（to=%s）",
+			got, minute.Format("2006-01-02T15:04"))
+	}
+	if entries := m["entries"].([]any); len(entries) != 1 {
+		t.Fatalf("entries=%d want 1", len(entries))
+	}
+}
+
+// TestUsageStatsUpperBoundCoversCurrentMinute 同上，覆盖用量分析页签的聚合口径：
+// 当前分钟内的请求必须计入 totals 与对应桶，否则统计卡与趋势图会滞后一分钟。
+func TestUsageStatsUpperBoundCoversCurrentMinute(t *testing.T) {
+	rl := NewReqLog("")
+	defer rl.Close()
+	minute := time.Date(2026, 9, 17, 17, 29, 0, 0, time.Local)
+	rl.Write(ChatEntry{Seq: 1, TS: minute.Add(30 * time.Second), Model: "cn:glm-5.2", Mode: "stream",
+		UID: "aaaaaaaa", Status: 200, TTFBMs: 10, InTokens: 1, Tokens: 2, TotalSec: 1})
+	p := New(Config{Version: "test", ReqLog: rl})
+
+	m := getJSON(t, p, monQueryURL("/panel/api/usage_stats", minute.Add(-time.Hour), minute))
+	if got := m["totals"].(map[string]any)["req"].(float64); got != 1 {
+		t.Fatalf("当前分钟内的请求未计入聚合：totals.req=%v want 1（to=%s）",
+			got, minute.Format("2006-01-02T15:04"))
+	}
+}
+
+// TestTryParseTimeUpperBound 上界解析的精度语义：分钟/秒精度的输入补足到该精度
+// 最后一刻；RFC3339 与 unix 毫秒保持原瞬时点（调用方给出的是明确时刻）。
+func TestTryParseTimeUpperBound(t *testing.T) {
+	minute := time.Date(2026, 9, 17, 17, 29, 0, 0, time.Local)
+	cases := []struct {
+		in   string
+		want time.Time
+	}{
+		{"", time.Time{}},
+		{"2026-09-17T17:29", minute.Add(time.Minute - time.Nanosecond)},
+		{"2026-09-17T17:29:30", minute.Add(30*time.Second + time.Second - time.Nanosecond)},
+		{"2026-09-17T17:29:30+08:00", time.Date(2026, 9, 17, 17, 29, 30, 0, time.FixedZone("", 8*3600))},
+	}
+	for _, c := range cases {
+		if got := parseTimeUpper(c.in); !got.Equal(c.want) {
+			t.Errorf("parseTimeUpper(%q)=%v want %v", c.in, got, c.want)
+		}
 	}
 }

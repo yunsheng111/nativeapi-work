@@ -54,8 +54,8 @@ func TestReqLogPersistRoundTrip(t *testing.T) {
 	rl.Write(good)
 	rl.Close()
 
-	// 当天分段文件已生成。
-	if _, err := os.Stat(filepath.Join(dir, segName(now.Format(dayLayout)))); err != nil {
+	// 当前小时的分段文件已生成。
+	if _, err := os.Stat(filepath.Join(dir, segName(now))); err != nil {
 		t.Fatalf("segment file missing: %v", err)
 	}
 
@@ -89,7 +89,7 @@ func TestReqLogSeedSkipsStaleAndBadLines(t *testing.T) {
 		mustJSON(t, testEntry(3, now, "cccccccc", "m", 200)),                    // 保留
 		"", // 空行
 	}
-	if err := os.WriteFile(filepath.Join(dir, segName(now.Format(dayLayout))), []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, segName(now)), []byte(strings.Join(lines, "\n")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	rl := NewReqLog(dir)
@@ -103,52 +103,159 @@ func TestReqLogSeedSkipsStaleAndBadLines(t *testing.T) {
 	}
 }
 
-// TestReqLogDaySegments 按 ts 所在日期分段：不同天的条目落到不同分段文件。
-func TestReqLogDaySegments(t *testing.T) {
+// TestReqLogHourSegments 按 ts 所在小时分段：跨小时的条目落到不同分段文件。
+func TestReqLogHourSegments(t *testing.T) {
 	dir := t.TempDir()
 	rl := NewReqLog(dir)
-	now := time.Now()
-	yesterday := now.AddDate(0, 0, -1)
-	rl.Write(testEntry(1, now, "aaaaaaaa", "m", 200))
-	rl.Write(testEntry(2, yesterday, "bbbbbbbb", "m", 200))
+	// 取整点对齐的两个相邻小时：直接用 now 减固定时长，在整点附近会落进同一小时。
+	h1 := time.Now().Truncate(time.Hour)
+	h0 := h1.Add(-time.Hour)
+	rl.Write(testEntry(1, h0.Add(time.Minute), "aaaaaaaa", "m", 200))
+	rl.Write(testEntry(2, h1.Add(time.Minute), "bbbbbbbb", "m", 200))
 	rl.Close()
-	for _, day := range []string{now.Format(dayLayout), yesterday.Format(dayLayout)} {
-		if _, err := os.Stat(filepath.Join(dir, segName(day))); err != nil {
-			t.Errorf("segment %s missing: %v", day, err)
+	for _, h := range []time.Time{h0, h1} {
+		if _, err := os.Stat(filepath.Join(dir, segName(h))); err != nil {
+			t.Errorf("segment %s missing: %v", segName(h), err)
 		}
 	}
 }
 
-// TestReqLogSweepPrunesOldSegments sweep 删除日期早于昨天的分段文件，无关文件不碰。
+// TestReqLogSeedReadsLegacyDailySegment 升级兼容：旧版按天分段仍能被载入，
+// 其中超出 24h 的条目按统一口径过滤。
+func TestReqLogSeedReadsLegacyDailySegment(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	lines := []string{
+		mustJSON(t, testEntry(1, now.Add(-2*time.Hour), "aaaaaaaa", "m", 200)),  // 保留
+		mustJSON(t, testEntry(2, now.Add(-30*time.Hour), "bbbbbbbb", "m", 200)), // 超窗
+	}
+	name := segPrefix + now.AddDate(0, 0, -1).Format(legacySegLayout) + segSuffix
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rl := NewReqLog(dir)
+	defer rl.Close()
+	entries, total, _ := rl.Query(QueryOpts{})
+	if total != 1 || len(entries) != 1 || entries[0].Seq != 1 {
+		t.Fatalf("legacy segment not loaded/filtered: total=%d entries=%+v", total, entries)
+	}
+}
+
+// TestReqLogSweepPrunesOldSegments sweep 按 segEnd 判过期：小时分段看 start+1h，
+// 旧版按天分段看 mtime（文件已冻结）；无关文件与正在写的分段不碰。
 func TestReqLogSweepPrunesOldSegments(t *testing.T) {
 	dir := t.TempDir()
 	rl := NewReqLog(dir)
 	defer rl.Close()
-	now := time.Now()
-	days := []string{
-		now.AddDate(0, 0, -3).Format(dayLayout), // 3 天前 → 应删除
-		now.AddDate(0, 0, -1).Format(dayLayout), // 昨天 → 保留
-		now.Format(dayLayout),                   // 今天 → 保留
-	}
-	for _, day := range days {
-		if err := os.WriteFile(filepath.Join(dir, segName(day)), nil, 0o644); err != nil {
+	now := time.Now().Truncate(time.Hour)
+	expiredHour := now.Add(-30 * time.Hour) // 区间 30h~29h 前：整体过期
+	keptHour := now.Add(-23 * time.Hour)    // 区间 23h~22h 前：仍在窗内
+	legacyExpired := segPrefix + now.AddDate(0, 0, -3).Format(legacySegLayout) + segSuffix
+	legacyToday := segPrefix + now.Format(legacySegLayout) + segSuffix
+	keep := []string{segName(keptHour), segName(now), legacyToday, "app.log"}
+	for _, name := range append([]string{segName(expiredHour), legacyExpired}, keep...) {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(dir, "app.log"), nil, 0o644); err != nil {
+	// legacy 分段的过期看 mtime：把 3 天前那份的最后写入时刻也挪到 3 天前，
+	// 今天那份保持"刚写过"。
+	old := now.AddDate(0, 0, -3)
+	if err := os.Chtimes(filepath.Join(dir, legacyExpired), old, old); err != nil {
 		t.Fatal(err)
 	}
 	rl.sweep()
-	if _, err := os.Stat(filepath.Join(dir, segName(days[0]))); !os.IsNotExist(err) {
-		t.Errorf("3-days-ago segment not removed (stat err=%v)", err)
-	}
-	for _, day := range days[1:] {
-		if _, err := os.Stat(filepath.Join(dir, segName(day))); err != nil {
-			t.Errorf("segment %s should survive sweep: %v", day, err)
+	for _, name := range []string{segName(expiredHour), legacyExpired} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Errorf("expired segment %s not removed (stat err=%v)", name, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, "app.log")); err != nil {
-		t.Errorf("unrelated file must not be touched: %v", err)
+	for _, name := range keep {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s should survive sweep: %v", name, err)
+		}
+	}
+}
+
+// TestReqLogSweepKeepsActiveSegment 正在写的分段即使时间戳很旧也不删：Windows 上
+// 句柄未关时删除必然失败（每轮 sweep 刷错误日志），Linux 上会静默丢后续写入。
+func TestReqLogSweepKeepsActiveSegment(t *testing.T) {
+	dir := t.TempDir()
+	rl := NewReqLog(dir)
+	defer rl.Close()
+	// 直塞一条 30h 前的条目：Write 会按它的 ts 打开对应分段并保持句柄。
+	stale := time.Now().Add(-30 * time.Hour)
+	rl.Write(testEntry(1, stale, "aaaaaaaa", "m", 200))
+	active := segName(stale)
+	if _, err := os.Stat(filepath.Join(dir, active)); err != nil {
+		t.Fatalf("active segment missing: %v", err)
+	}
+	rl.sweep()
+	if _, err := os.Stat(filepath.Join(dir, active)); err != nil {
+		t.Errorf("active segment must not be pruned: %v", err)
+	}
+}
+
+// TestParseSegRejectsMalformedNames 命名约定之外的串一律拒绝：长度不对、日期非法
+// （time.Parse 会把 20260230 归一化成 03-02）、前缀后缀不完整。
+func TestParseSegRejectsMalformedNames(t *testing.T) {
+	bad := []string{
+		"requests-20260230.jsonl", // 归一化日期：回写比对必须拒绝
+		"requests-202602301.jsonl",
+		"requests-202609.jsonl",
+		"requests-.jsonl",
+		"2026091723.jsonl",
+		"requests-2026091723.log",
+		"other-2026091723.jsonl",
+	}
+	for _, name := range bad {
+		if _, _, ok := parseSeg(name); ok {
+			t.Errorf("parseSeg(%q) 应拒绝", name)
+		}
+	}
+	good := []struct {
+		name string
+		span time.Duration
+	}{
+		{"requests-2026091723.jsonl", segSpan},     // 小时分段
+		{"requests-20260917.jsonl", legacySegSpan}, // 旧版按天分段
+	}
+	for _, tc := range good {
+		start, span, ok := parseSeg(tc.name)
+		if !ok {
+			t.Errorf("parseSeg(%q) 应接受", tc.name)
+			continue
+		}
+		if start.IsZero() || span != tc.span {
+			t.Errorf("parseSeg(%q) start=%v span=%v want span=%v", tc.name, start, span, tc.span)
+		}
+	}
+}
+
+// TestReqLogQuerySameTSStableOrder 同 ts 条目的分页顺序必须稳定（Seq 降序兜底），
+// 否则 offset 分页会在相邻页之间重复或漏行。
+func TestReqLogQuerySameTSStableOrder(t *testing.T) {
+	rl := NewReqLog("")
+	defer rl.Close()
+	ts := time.Now() // 同一时刻：模拟同一毫秒内完成的多个请求
+	for i := 1; i <= 6; i++ {
+		rl.Write(testEntry(int64(i), ts, "aaaaaaaa", "m", 200))
+	}
+	var got []int64
+	for offset := 0; offset < 6; offset += 2 {
+		page, total, _ := rl.Query(QueryOpts{Limit: 2, Offset: offset})
+		if total != 6 {
+			t.Fatalf("offset=%d total=%d want 6", offset, total)
+		}
+		for _, e := range page {
+			got = append(got, e.Seq)
+		}
+	}
+	want := []int64{6, 5, 4, 3, 2, 1}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("同 ts 分页顺序 %v，want %v（重复或漏行）", got, want)
+		}
 	}
 }
 

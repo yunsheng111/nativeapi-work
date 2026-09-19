@@ -15,6 +15,12 @@ let overviewAt = 0;     // 最近一次 overview 落地的本地时刻，用来�
    监控页），let 声明若在后面会踩暂时性死区，让整个面板初始化报错。 */
 let monRange = '24h', monTab = 'detail', monFilters = { uid: '', model: '', mode: '' }, monTimer = null;
 let monEntries = [], monUidSig = '', monReloadTimer = null, monDdQuery = '';
+/* 分页状态：monPage 从 1 起（1 = 最新一页），monTotal 是服务端返回的过滤后总数
+   （翻页时用它收敛页码输入），monRenderedPage 是表体当前真实内容所属的页——取数
+   失败时靠它把页码回滚，避免"页码前进、表体没变"。monSeenModels 跨页累积模型名，
+   模型筛选下拉在 models_all 拉取失败时用它兜底，只认当前页会随翻页缩水。 */
+let monPage = 1, monPageSize = 100, monTotal = 0, monRenderedPage = 1;
+const monSeenModels = new Set();
 
 const $ = id => document.getElementById(id);
 
@@ -45,7 +51,9 @@ async function api(path, opts = {}) {
   const k = localStorage.getItem(LS_KEY);
   if (k) h['Authorization'] = 'Bearer ' + k;
   if (opts.body) h['Content-Type'] = 'application/json';
-  const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
+  // cache:'no-store'：监控查询串里 to= 是分钟精度，同一分钟内的刷新 URL 相同，
+  // 不禁缓存时 WebView2 会回缓存里的旧响应——SSE 触发的实时刷新就"慢一拍"。
+  const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h, cache: 'no-store' }));
   if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
@@ -162,7 +170,7 @@ function go(v) {
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'packages') loadPackages();
-  if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
+  if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(true); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
@@ -572,6 +580,14 @@ function fmtRowTime(ts) {
   return (d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate())
     ? hm : (d.getMonth() + 1) + '-' + d.getDate() + ' ' + hm;
 }
+// fmtFullTime 完整年月日时分秒，用于时间列的 title——列宽按最长跨天格式定死，
+// 但浏览器缩放（Ctrl+滚轮）会等比放大字体，超出时仍能靠 title 读到完整时刻。
+function fmtFullTime(ts) {
+  const d = new Date(ts);
+  if (isNaN(d)) return '';
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' +
+    pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+}
 // acctName 行内 uid 是前 8 位短号：映射回账号昵称，映射不上显示原前缀
 function acctName(uid8) {
   if (!uid8 || uid8 === '-') return '—';
@@ -664,19 +680,49 @@ async function loadMonitoring(quiet) {
   else { stopMonTimer(); await loadMonList(quiet); }
 }
 
-// loadMonList 明细/错误页签：服务端按时间窗+筛选+err_only 过滤并限量返回
+// loadMonList 明细/错误页签：服务端按时间窗+筛选+err_only 过滤，按 limit/offset
+// 取一页。offset 分页下新日志入栈会把整页内容整体后移，翻到第 2 页还跟着静默刷新
+// 的话，用户正在看的那几条会自己跑掉——因此静默刷新只在第 1 页生效（筛选/翻页/手动
+// 刷新都不受影响）。
 async function loadMonList(quiet) {
   const isErr = monTab === 'err';
+  if (quiet && monPage > 1) return;
+  // 一致性锚点：翻页/改每页条数都会发起新请求，先发的旧响应可能后落地。
+  // 不认锚点就会出现"表体是第 1 页、页码写着第 2 页"，而且因为非首页吞掉静默
+  // 刷新，这个错位不会自愈。锚点不匹配即丢弃该响应。
+  const page = monPage, size = monPageSize;
+  const extra = { limit: size, offset: (page - 1) * size };
+  if (isErr) extra.err_only = 1;
   try {
-    const d = await api('chatlogs?' + monQS(isErr ? { err_only: 1 } : null));
+    const d = await api('chatlogs?' + monQS(extra));
+    if (page !== monPage || size !== monPageSize) return; // 用户已翻页或改了每页条数
+    const total = d.total || 0;
+    // 日志过期或筛选变窄都会让页数收缩，当前页可能越界：退到最后一页重取。
+    // 收敛条件是"新页码不再越界"，故最多回退一次，不会反复递归。
+    const pages = Math.max(1, Math.ceil(total / size));
+    if (page > pages) { monPage = pages; return loadMonList(quiet); }
+    monTotal = total;
     monEntries = d.entries || [];
-    renderMonStats(d.stats || entriesTotals(monEntries, d.total));
-    renderMonList(isErr, d.total);
-  } catch (e) { if (!quiet) toast(e.message, 'err'); }
+    for (const e of monEntries) {
+      const m = normModel(e.model);
+      if (m && m !== '-') monSeenModels.add(m);
+    }
+    renderMonStats(d.stats || entriesTotals(monEntries, total));
+    renderMonList(isErr, total);
+  } catch (e) {
+    if (quiet) return;
+    // 取数失败：页码回滚到表体真实内容所在的那一页，保持"页码 ↔ 表体"一致
+    if (monPage !== monRenderedPage) {
+      monPage = monRenderedPage;
+      renderMonPager(Math.max(1, Math.ceil(monTotal / monPageSize)));
+    }
+    toast(e.message, 'err');
+  }
 }
 
-// renderMonList 明细表：最新在前；err 页签整行浅红底。Token 两行（↑输出/↓输入）、
-// 响应性能三行小字（首字/速率/总耗时），错误列 CSS 截断 + title 全文
+// renderMonList 明细表：服务端已按 ts 降序返回（最新在前），前端只做防御性排序；
+// err 页签整行浅红底。Token 两行（↑输出/↓输入）、响应性能三行小字（首字/速率/总耗时），
+// 错误列 CSS 截断 + title 全文。页脚同步刷新统计文案与分页条。
 function renderMonList(isErr, total) {
   const tb = $('monBody');
   const entries = monEntries.slice().sort((a, b) => new Date(b.ts) - new Date(a.ts));
@@ -688,7 +734,7 @@ function renderMonList(isErr, total) {
       const ok = e.status >= 200 && e.status < 400;
       const errText = e.err ? String(e.err) : '';
       return '<tr' + (isErr ? ' class="row-err"' : '') + '>' +
-        '<td class="num">' + fmtRowTime(e.ts) + '</td>' +
+        '<td class="num" title="' + esc(fmtFullTime(e.ts)) + '">' + fmtRowTime(e.ts) + '</td>' +
         '<td title="' + esc(normModel(e.model)) + '">' + esc(normModel(e.model)) + '</td>' +
         '<td title="' + esc(acctName(e.uid)) + '">' + esc(acctName(e.uid)) + '</td>' +
         '<td>' + (e.mode === 'stream' ? '<span class="tag accent">流式</span>' : '<span class="tag mute">非流式</span>') + '</td>' +
@@ -703,7 +749,43 @@ function renderMonList(isErr, total) {
     }).join('');
   }
   const n = total != null ? total : entries.length;
-  $('monNote').innerHTML = '共 <b>' + n + '</b> 条 · 显示前 <b>' + entries.length + '</b> 条 · 内存与磁盘保留 24 小时';
+  const pages = Math.max(1, Math.ceil(n / monPageSize));
+  monRenderedPage = monPage; // 表体内容与页码的对应关系：失败回滚以它为准
+  // 非首页不跟随实时刷新（见 loadMonList），把这条规则显式写出来，避免用户以为
+  // 页面卡住了。
+  $('monNote').innerHTML = '共 <b>' + n + '</b> 条 · 内存与磁盘保留最近 24 小时' +
+    (monPage > 1 ? ' · <span class="bad">非首页已暂停实时刷新（回首页恢复）</span>' : '');
+  renderMonPager(pages);
+}
+
+// renderMonPager 刷新分页条：页码显示、边界按钮禁用态、页码输入框上限。
+function renderMonPager(pages) {
+  const inp = $('monPgInput');
+  $('monPgInfo').textContent = '第 ' + monPage + ' / ' + pages + ' 页';
+  inp.max = pages;
+  if (document.activeElement !== inp) inp.value = monPage; // 输入中不回写，避免打断输入
+  $('monPgFirst').disabled = $('monPgPrev').disabled = monPage <= 1;
+  $('monPgNext').disabled = $('monPgLast').disabled = monPage >= pages;
+}
+
+// gotoMonPage 跳到指定页：越界收敛到 [1, pages]，同页不重复取数
+// （越界输入要把输入框弹回当前页，所以同页也要走一次 renderMonPager）。
+function gotoMonPage(p) {
+  const pages = Math.max(1, Math.ceil(monTotal / monPageSize));
+  const next = Math.min(Math.max(1, Math.floor(p)), pages);
+  if (next === monPage) { renderMonPager(pages); return; }
+  monPage = next;
+  loadMonitoring();
+}
+
+// commitMonPageInput 提交页码输入框：空串/非数字一律回弹当前页——Number('') 是 0
+// （有限数），直接放行会"静默跳到第 1 页"，与用户的输入意图无关。number 输入框遇到
+// 非法字符会清空 value，这条分支正是它的落点。
+function commitMonPageInput() {
+  const raw = $('monPgInput').value.trim();
+  const p = Number(raw);
+  if (raw === '' || !isFinite(p)) { renderMonPager(Math.max(1, Math.ceil(monTotal / monPageSize))); return; }
+  gotoMonPage(p);
 }
 
 // loadMonAnalysis 用量分析页签：usage_stats 聚合（概览卡 + 趋势图 + 模型/账号分布）
@@ -895,8 +977,10 @@ async function loadMonRuntime(quiet) {
 
 function stopMonTimer() { if (monTimer) { clearInterval(monTimer); monTimer = null; } }
 
-// scheduleMonReload 模型输入防抖：停输 300ms 才重拉，避免逐键打接口
+// scheduleMonReload 模型输入防抖：停输 300ms 才重拉，避免逐键打接口。
+// 筛选变化会换掉整个结果集，原页码随即失去意义，故一并回第 1 页。
 function scheduleMonReload() {
+  monPage = 1;
   if (monReloadTimer) clearTimeout(monReloadTimer);
   monReloadTimer = setTimeout(() => { monReloadTimer = null; loadMonitoring(); }, 300);
 }
@@ -907,13 +991,10 @@ function scheduleMonReload() {
    双向包含），点击条目回填输入框并防抖重拉明细。 */
 let modelCatalog = null; // null=未加载；数组=已加载（含空数组=加载过但为空）
 
+// observedModels 兜底模型名：取跨页累积的观测集合（loadMonList 每次落地都往里塞），
+// 而不是当前页——分页后只看当前页会让下拉目录随翻页缩水。
 function observedModels() {
-  const set = new Set();
-  for (const e of monEntries) {
-    const m = normModel(e.model);
-    if (m && m !== '-') set.add(m);
-  }
-  return Array.from(set).sort();
+  return Array.from(monSeenModels).sort();
 }
 
 function renderMonModelDd() {
@@ -1002,20 +1083,42 @@ $('monTabs').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-tab]');
   if (!b) return;
   monTab = b.dataset.tab;
+  monPage = 1; // 换页签 = 换结果集，页码回到第 1 页
   document.querySelectorAll('#monTabs .chip').forEach(c => c.classList.toggle('on', c === b));
   showMonPanels();
   loadMonitoring();
 });
-$('monRange').onchange = () => { monRange = $('monRange').value; loadMonitoring(); };
-$('monUid').onchange = () => { monFilters.uid = $('monUid').value; loadMonitoring(); };
-$('monMode').onchange = () => { monFilters.mode = $('monMode').value; loadMonitoring(); };
-$('monRefresh').onclick = () => loadMonitoring();
+/* 时间窗/账号/模式筛选：任一变化都会换掉结果集，页码一律回第 1 页（模型输入框走
+   scheduleMonReload，那里同样回第 1 页）。翻页本身只改 monPage，不动筛选。 */
+$('monRange').onchange = () => { monRange = $('monRange').value; monPage = 1; loadMonitoring(); };
+$('monUid').onchange = () => { monFilters.uid = $('monUid').value; monPage = 1; loadMonitoring(); };
+$('monMode').onchange = () => { monFilters.mode = $('monMode').value; monPage = 1; loadMonitoring(); };
+$('monRefresh').onclick = () => loadMonitoring(); // 手动刷新保留当前页
 // 重置：清空筛选 + 时间范围回默认，并立即重拉
 $('monReset').onclick = () => {
   monRange = '24h';
   $('monRange').value = '24h';
   monFilters = { uid: '', model: '', mode: '' };
   $('monUid').value = ''; $('monModel').value = ''; $('monMode').value = '';
+  monPage = 1;
+  loadMonitoring();
+};
+
+/* 分页控件：首页/上一页/下一页/末页 + 页码直跳 + 每页条数。
+   翻页只重取目标页；每页条数变化会让原页码失去意义，回第 1 页。
+   页码输入框：change（数字框上下箭头/失焦）+ Enter 都提交，非法值由
+   commitMonPageInput 弹回，越界值由 gotoMonPage 收敛。 */
+$('monPgFirst').onclick = () => gotoMonPage(1);
+$('monPgPrev').onclick = () => gotoMonPage(monPage - 1);
+$('monPgNext').onclick = () => gotoMonPage(monPage + 1);
+$('monPgLast').onclick = () => gotoMonPage(Math.ceil(monTotal / monPageSize));
+$('monPgInput').addEventListener('change', commitMonPageInput);
+$('monPgInput').addEventListener('keydown', ev => {
+  if (ev.key === 'Enter') { ev.preventDefault(); commitMonPageInput(); }
+});
+$('monPgSize').onchange = () => {
+  monPageSize = Number($('monPgSize').value) || 100;
+  monPage = 1;
   loadMonitoring();
 };
 
@@ -1944,6 +2047,10 @@ $('btnVcRefresh').onclick = loadSchoolVouchers;
    （running=false 但 seq 停在旧值）不再回写视图——否则扫描结果 3 秒后被上一轮
    队列状态覆盖。 */
 let queueTimer = null, lastQueueSeq = 0;
+/* 列表归属：'scan' = 「扫描待办」的只读快照，'queue' = 执行队列的实时进度。两者互斥。
+   队列快照只在"本轮确实在跑"时接管列表；一轮结束即停止回写——否则上一轮的残留
+   items 会在 1 秒内盖掉扫描结果（列表"闪一下就没了"）。 */
+let qcOwner = '', queueRunning = false;
 const GROWTH_TITLES = {}; // code → 展示名（扫描时从任务列表带出）
 // 队列分拣视图：open=未完成（待执行/排队/执行中/失败/跳过），done=已完成。
 // 渲染数据留在 qcGroups，切标签纯前端重画，不打接口。
@@ -1957,6 +2064,8 @@ $('qcTabs').addEventListener('click', ev => {
 });
 $('btnScanAll').onclick = async () => {
   const b = $('btnScanAll');
+  if (queueRunning) { toast('队列正在执行中，等本轮结束后再扫描', 'err'); return; }
+  qcOwner = 'scan'; // 先夺回列表归属：在途的队列轮询响应不得再覆盖扫描结果
   b.disabled = true; b.textContent = '扫描中…';
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
@@ -1973,6 +2082,7 @@ $('btnRunQueue').onclick = async () => {
     const r = await api('tasks/run_queue', { method: 'POST', body: JSON.stringify({ concurrency: conc }) });
     if (!r.started) { toast(r.message || '没有待办任务', 'ok'); return; }
     lastQueueSeq = r.seq || 0;
+    qcOwner = 'queue'; queueRunning = true; // 本轮队列接管列表
     toast('队列已启动：' + r.total + ' 项（并发 ' + conc + '）', 'ok');
     startQueuePolling();
   } catch (e) { toast(e.message, 'err'); }
@@ -2076,27 +2186,41 @@ function groupsFromQueue(items) {
   }
   return Array.from(by.values());
 }
-async function pollQueueOnce() {
-  try {
-    const q = await api('tasks/queue');
-    if (!q.started) return;
-    // 只渲染本页启动过的那轮队列（q.running 时也要同代次——刷新页面后不再接管旧队列）。
-    if (lastQueueSeq && q.seq !== lastQueueSeq) return;
-    renderQueue(groupsFromQueue(q.items || []), q);
-  } catch (e) { /* 静默 */ }
+async function pollQueueOnce(force) {
+  // 没有在跑的队列时不发请求也不回写（任务中心页每秒一拍的 tickLocal 会走到这里）。
+  if (!queueRunning && !force) return null;
+  let q;
+  try { q = await api('tasks/queue'); } catch (e) { return null; }
+  if (!q.started) return null;
+  // 接管条件：本轮在跑；或本页正在跟踪的那一轮收到 running=false 的收尾那一拍。
+  // 历史残留快照（started=true / running=false / 非本页轮次）永不接管视图。
+  if (!q.running && !queueRunning) return null;
+  // 只渲染本页启动过的那轮队列（刷新页面后不再接管旧队列）。
+  if (lastQueueSeq && q.seq !== lastQueueSeq) return null;
+  if (qcOwner === 'scan') return null; // 扫描结果优先，挡住在途的队列响应
+  qcOwner = 'queue';
+  queueRunning = !!q.running;
+  renderQueue(groupsFromQueue(q.items || []), q);
+  return q;
 }
 function startQueuePolling() {
   if (queueTimer) clearInterval(queueTimer);
+  let miss = 0; // 连续拉取失败计数：接口持续异常时不要 3s 一拍无限打下去
   queueTimer = setInterval(async () => {
-    await pollQueueOnce();
-    try {
-      const q = await api('tasks/queue');
-      if (!q.running) {
-        clearInterval(queueTimer); queueTimer = null;
-        toast('任务队列执行结束', 'ok');
-        loadSchoolStatus(true);
+    const q = await pollQueueOnce(true);
+    if (!q) {
+      if (++miss >= 20) {
+        clearInterval(queueTimer); queueTimer = null; queueRunning = false;
+        toast('队列进度拉取连续失败，已停止轮询', 'err');
       }
-    } catch (e) { /* 忽略 */ }
+      return;
+    }
+    miss = 0;
+    if (!q.running) {
+      clearInterval(queueTimer); queueTimer = null;
+      toast('任务队列执行结束', 'ok');
+      loadSchoolStatus(true);
+    }
   }, 3000);
 }
 
